@@ -1,8 +1,13 @@
 # Multi-stage Dockerfile for ComfyUI with MSS-Login
 # Base: Ubuntu 24.04 LTS (Noble Numbat) with CUDA 12.8.0 Runtime (matches pyproject.toml cu128 index)
+# Supports NVIDIA CUDA, Apple Silicon Metal (M-Series), and Intel/CPU hardware targets.
 # Uses official Comfy-CLI via Astral UV for fast, reproducible ComfyUI deployment, GPU/CPU auto-detection, and updates.
 
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04 AS base
+ARG BASE_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu24.04
+FROM ${BASE_IMAGE} AS base
+
+ARG ACCELERATOR=nvidia
+ARG CUDA_VERSION=12.8
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -29,8 +34,17 @@ RUN uv python install 3.13 \
 
 WORKDIR /app
 
-# Install latest stable ComfyUI using official Comfy-CLI with uv fast-deps & CUDA 12.8 (matches pyproject.toml)
-RUN comfy --workspace /app/ComfyUI install --version latest --nvidia --cuda-version 12.8 --fast-deps
+# Install latest stable ComfyUI using official Comfy-CLI tailored to target accelerator:
+# - nvidia: --nvidia --cuda-version ${CUDA_VERSION}
+# - m-series: --m-series (Apple Silicon Metal)
+# - cpu: --cpu (Intel Mac or generic CPU hosts)
+RUN if [ "$ACCELERATOR" = "m-series" ]; then \
+        comfy --workspace /app/ComfyUI install --version latest --m-series --fast-deps; \
+    elif [ "$ACCELERATOR" = "cpu" ]; then \
+        comfy --workspace /app/ComfyUI install --version latest --cpu --fast-deps; \
+    else \
+        comfy --workspace /app/ComfyUI install --version latest --nvidia --cuda-version ${CUDA_VERSION} --fast-deps; \
+    fi
 
 ENV VIRTUAL_ENV=/app/ComfyUI/.venv \
     PATH="/app/ComfyUI/.venv/bin:$PATH"
@@ -40,11 +54,16 @@ COPY . /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
 WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
-# Install MSS-Login extension in editable mode and provision headless Chromium
-RUN uv pip install -e . \
-    && playwright install --with-deps chromium || true
+# Install platform-specific dependencies and extension in editable mode
+RUN if [ "$ACCELERATOR" = "m-series" ] && [ -f requirements_metal.txt ]; then \
+        uv pip install -r requirements_metal.txt; \
+    elif [ "$ACCELERATOR" = "cpu" ] && [ -f requirements_cpu.txt ]; then \
+        uv pip install -r requirements_cpu.txt; \
+    fi \
+    && uv pip install -e . \
+    && (playwright install --with-deps chromium || true)
 
-# Provide entrypoint (GPU/CPU auto-detection) and update script inside container
+# Provide entrypoint (GPU/MPS/CPU auto-detection) and update script inside container
 COPY deploy/entrypoint.sh /app/entrypoint.sh
 COPY deploy/update.sh /app/update.sh
 RUN chmod +x /app/entrypoint.sh /app/update.sh
