@@ -1,0 +1,70 @@
+# Portainer Stack Definition for ComfyUI with MSS-Login
+# Compatible with Portainer Web UI Stack Editor (Standalone Docker and Swarm)
+# Base: Ubuntu 24.04 LTS with CUDA 12.8 (matches pyproject.toml cu128 index)
+#
+# Environment variables configurable in Portainer UI:
+# - HOST_BASE_URL: Public URL of your ComfyUI instance (e.g. https://ai.example.com)
+# - SECRET_KEY: 32+ character random secret string for JWT and SQLCipher encryption
+# - PORT: Host port mapping (default: 8188)
+# - COMFYUI_IMAGE: Docker image to run (default: monster-spawned-studios/comfyui-mss-login:cu128)
+# - CUDA_VERSION: Target CUDA version (default: 12.8, aligned with pyproject.toml cu128)
+# - DEVICE_TYPE: Target device (auto, cuda, cpu - auto-detects NVIDIA GPU or falls back to CPU)
+# - CPE_EMBEDDED_CONVERT: Enable embedded headless graph parser & browser pool for Comfy Portal (true/false)
+
+name: comfyui-server
+
+services:
+  comfyui:
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:cu128}
+    container_name: comfyui-mss-login
+    restart: unless-stopped
+    ports:
+      - "${HOST:-127.0.0.1}:${PORT:-8188}:${PORT:-8188}/tcp"
+    environment:
+      - HOST_BASE_URL=${HOST_BASE_URL:-http://${HOST:-127.0.0.1}:${PORT:-8188}}
+      - SECRET_KEY=${SECRET_KEY:-}
+      - MSS_LOGIN_DATA_DIR=${MSS_LOGIN_DATA_DIR:-/data/mss-login}
+      - CPE_EMBEDDED_CONVERT=${CPE_EMBEDDED_CONVERT:-true}
+      - EXPERIMENTAL_LOGIN_BACKGROUND=${EXPERIMENTAL_LOGIN_BACKGROUND:-true}
+      - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-}
+      - WEBAUTHN_ORIGINS=${WEBAUTHN_ORIGINS:-}
+      - PYTHONUNBUFFERED=1
+      - CUDA_VERSION=${CUDA_VERSION:-12.8}
+      - DEVICE_TYPE=${DEVICE_TYPE:-auto}
+      - CLI_ARGS=--listen ${HOST:-127.0.0.1} --port ${PORT:-8188}
+    volumes:
+      - mss_login_data:${MSS_LOGIN_DATA_DIR:-/data/mss-login}
+      - comfyui_models:/app/ComfyUI/models
+      - comfyui_output:/app/ComfyUI/output
+      - comfyui_input:/app/ComfyUI/input
+      - comfyui_user:/app/ComfyUI/user
+      - comfyui_custom_nodes:/app/ComfyUI/custom_nodes
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    labels:
+      - "io.portainer.accesscontrol.public=true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8188/mss-login/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mss_login_data:
+    driver: local
+  comfyui_models:
+    driver: local
+  comfyui_output:
+    driver: local
+  comfyui_input:
+    driver: local
+  comfyui_user:
+    driver: local
+  comfyui_custom_nodes:
+    driver: local

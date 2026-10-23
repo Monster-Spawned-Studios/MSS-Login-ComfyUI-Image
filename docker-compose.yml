@@ -1,0 +1,67 @@
+# Production Docker Compose for ComfyUI with MSS-Login
+# Base: Ubuntu 24.04 LTS with CUDA 12.8 (aligns with pyproject.toml cu128 index)
+# Supports NVIDIA Container Toolkit GPU acceleration and automatic CPU fallback.
+
+services:
+  comfyui:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:cu128}
+    container_name: comfyui-mss-login
+    restart: unless-stopped
+    ports:
+      - "${HOST:-127.0.0.1}:${PORT:-8188}:${PORT:-8188}/tcp"
+    environment:
+      # MSS-Login Security and Configuration
+      - HOST_BASE_URL=${HOST_BASE_URL:-http://${HOST:-127.0.0.1}:${PORT:-8188}}
+      - SECRET_KEY=${SECRET_KEY:-}
+      - MSS_LOGIN_DATA_DIR=${MSS_LOGIN_DATA_DIR:-/data/mss-login}
+      - CPE_EMBEDDED_CONVERT=${CPE_EMBEDDED_CONVERT:-true}
+      - EXPERIMENTAL_LOGIN_BACKGROUND=${EXPERIMENTAL_LOGIN_BACKGROUND:-true}
+      - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-}
+      - WEBAUTHN_ORIGINS=${WEBAUTHN_ORIGINS:-}
+      - PYTHONUNBUFFERED=1
+      # Hardware & Driver Auto-Detection (matches pyproject.toml cu128 / CPU)
+      - CUDA_VERSION=${CUDA_VERSION:-12.8}
+      - DEVICE_TYPE=${DEVICE_TYPE:-auto}
+      # CLI Args for ComfyUI
+      - CLI_ARGS=--listen ${HOST:-127.0.0.1} --port ${PORT:-8188}
+    volumes:
+      # Persistent MSS-Login database, secrets, backgrounds, and user workflows
+      - mss_data:${MSS_LOGIN_DATA_DIR:-/data/mss-login}
+      # ComfyUI assets (models, outputs, inputs, user settings)
+      - comfy_models:/app/ComfyUI/models
+      - comfy_output:/app/ComfyUI/output
+      - comfy_input:/app/ComfyUI/input
+      - comfy_user:/app/ComfyUI/user
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8188/mss-login/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mss_data:
+    driver: local
+    name: comfyui_mss_data
+  comfy_models:
+    driver: local
+    name: comfyui_models
+  comfy_output:
+    driver: local
+    name: comfyui_output
+  comfy_input:
+    driver: local
+    name: comfyui_input
+  comfy_user:
+    driver: local
+    name: comfyui_user
