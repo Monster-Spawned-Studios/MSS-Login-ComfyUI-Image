@@ -1,13 +1,13 @@
-# Multi-stage Dockerfile for ComfyUI with MSS-Login
-# Base: Ubuntu 24.04 LTS (Noble Numbat) with CUDA 12.8.0 Runtime (matches pyproject.toml cu128 index)
-# Supports NVIDIA CUDA, Apple Silicon Metal (M-Series), and Intel/CPU hardware targets.
-# Uses official Comfy-CLI via Astral UV for fast, reproducible ComfyUI deployment, GPU/CPU auto-detection, and updates.
+# Hardware-agnostic multi-stage Dockerfile for ComfyUI with MSS-Login
+# Base: Ubuntu 24.04 LTS (Noble Numbat) — does NOT assume a specific GPU backend.
+# Supports NVIDIA CUDA (cu130 / cu128), AMD ROCm, Intel Arc/XPU, Apple Silicon Metal (M-Series), and CPU.
+# Uses official Comfy-CLI and Astral UV for reproducible ComfyUI deployment and automatic runtime PyTorch provisioning.
 
-ARG BASE_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu24.04
+ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE} AS base
 
-ARG ACCELERATOR=nvidia
-ARG CUDA_VERSION=12.8
+ARG ACCELERATOR=auto
+ARG CUDA_VERSION=auto
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -34,16 +34,21 @@ RUN uv python install 3.13 \
 
 WORKDIR /app
 
-# Install latest stable ComfyUI using official Comfy-CLI tailored to target accelerator:
-# - nvidia: --nvidia --cuda-version ${CUDA_VERSION}
-# - m-series: --m-series (Apple Silicon Metal)
-# - cpu: --cpu (Intel Mac or generic CPU hosts)
-RUN if [ "$ACCELERATOR" = "m-series" ]; then \
-        comfy --workspace /app/ComfyUI install --version latest --m-series --fast-deps; \
-    elif [ "$ACCELERATOR" = "cpu" ]; then \
-        comfy --workspace /app/ComfyUI install --version latest --cpu --fast-deps; \
+# Install latest stable ComfyUI core.
+# When ACCELERATOR=auto (default), install ComfyUI core without assuming a GPU backend;
+# entrypoint.sh detects the host GPU at runtime and installs the matching PyTorch wheels.
+RUN if [ "$ACCELERATOR" = "m-series" ] || [ "$ACCELERATOR" = "metal" ]; then \
+        comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --m-series --fast-deps; \
+    elif [ "$ACCELERATOR" = "nvidia" ] || [ "$ACCELERATOR" = "cuda" ]; then \
+        if [ "$CUDA_VERSION" != "auto" ] && [ -n "$CUDA_VERSION" ]; then \
+            comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --nvidia --cuda-version ${CUDA_VERSION} --fast-deps; \
+        else \
+            comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --nvidia --fast-deps; \
+        fi; \
+    elif [ "$ACCELERATOR" = "amd" ] || [ "$ACCELERATOR" = "rocm" ]; then \
+        comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --amd --fast-deps; \
     else \
-        comfy --workspace /app/ComfyUI install --version latest --nvidia --cuda-version ${CUDA_VERSION} --fast-deps; \
+        comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps; \
     fi
 
 ENV VIRTUAL_ENV=/app/ComfyUI/.venv \
@@ -54,16 +59,11 @@ COPY . /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
 WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
-# Install platform-specific dependencies and extension in editable mode
-RUN if [ "$ACCELERATOR" = "m-series" ] && [ -f requirements_metal.txt ]; then \
-        uv pip install -r requirements_metal.txt; \
-    elif [ "$ACCELERATOR" = "cpu" ] && [ -f requirements_cpu.txt ]; then \
-        uv pip install -r requirements_cpu.txt; \
-    fi \
-    && uv pip install -e . \
+# Install non-backend-specific extension dependencies; PyTorch backend is reconciled by entrypoint.sh
+RUN uv pip install -r requirements.txt \
     && (playwright install --with-deps chromium || true)
 
-# Provide entrypoint (GPU/MPS/CPU auto-detection) and update script inside container
+# Provide entrypoint (runtime GPU auto-detection & PyTorch installer) and update script inside container
 COPY deploy/entrypoint.sh /app/entrypoint.sh
 COPY deploy/update.sh /app/update.sh
 RUN chmod +x /app/entrypoint.sh /app/update.sh
@@ -73,6 +73,7 @@ WORKDIR /app/ComfyUI
 EXPOSE 8188
 
 ENV MSS_LOGIN_DATA_DIR=/data/mss-login \
-    CPE_EMBEDDED_CONVERT=true
+    CPE_EMBEDDED_CONVERT=true \
+    DEVICE_TYPE=auto
 
 ENTRYPOINT ["/app/entrypoint.sh"]
