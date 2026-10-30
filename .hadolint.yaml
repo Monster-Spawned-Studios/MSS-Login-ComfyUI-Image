@@ -1,0 +1,6 @@
+# Hadolint configuration for ComfyUI-MSS-Login
+ignored:
+  # Pin versions in apt-get install (base image is Ubuntu 24.04 LTS noble; security patches change package patch levels)
+  - DL3008
+  # Non-numeric user-id (user comfy is created with explicit UID/GID 1000 in the image)
+  - DL3066

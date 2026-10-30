@@ -1,0 +1,32 @@
+# NVIDIA CUDA Hardware Acceleration Overlay for ComfyUI MSS-Login
+# Linux & Windows 11 Pro (WSL2 with NVIDIA Container Toolkit)
+#
+# Usage:
+#   docker compose -f portainer-stack.yml -f hwaccel.nvidia.yml up -d
+# Or in portainer-stack.yml:
+#   extends:
+#     file: hwaccel.nvidia.yml
+#     service: comfyui-server
+
+services:
+  comfyui-server:
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:nvidia}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: nvidia
+      args:
+        ACCELERATOR: cuda
+        CUDA_VERSION: ${CUDA_VERSION:-cu128}
+    environment:
+      DEVICE_TYPE: cuda
+      NVIDIA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+

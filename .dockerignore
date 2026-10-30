@@ -1,8 +1,19 @@
+# Git and version control
 .git
+.gitignore
+.gitmodules
+
+# CI/CD and repository metadata
 .github
 .gitea
 .agents
+.cursor
+
+# IDE and development configuration
 .vscode
+.idea
+
+# Python virtual environments, caches, and build artifacts
 .venv
 __pycache__
 *.pyc
@@ -13,8 +24,27 @@ __pycache__
 build
 dist
 *.egg-info
+
+# Frontend build artifacts and node dependencies
 node_modules
 web/frontend/node_modules
 web/dist
+
+# Planning, scratch, and local reports
 _planning
 scratch
+ci-reports
+*.tar.gz
+*.zip
+
+# Local environment configuration & Docker Compose companion overlays
+deploy/.env
+deploy/.env.local
+deploy/*.env
+deploy/hwaccel*.yml
+deploy/portainer-stack.yml
+deploy/docker-compose*.yml
+deploy/scripts
+deploy/ci-reports
+deploy/.github
+deploy/.gitea

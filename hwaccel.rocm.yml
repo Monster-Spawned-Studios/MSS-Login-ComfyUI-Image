@@ -1,0 +1,29 @@
+# AMD ROCm Hardware Acceleration Overlay for ComfyUI MSS-Login
+# Linux hosts with AMD Radeon / Instinct GPUs
+#
+# Usage:
+#   docker compose -f portainer-stack.yml -f hwaccel.rocm.yml up -d
+# Or in portainer-stack.yml:
+#   extends:
+#     file: hwaccel.rocm.yml
+#     service: comfyui-server
+
+services:
+  comfyui-server:
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:rocm}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: rocm
+      args:
+        ACCELERATOR: rocm
+        ROCM_VERSION: ${ROCM_VERSION:-rocm6.2.4}
+    environment:
+      DEVICE_TYPE: rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - "video"
+      - "render"
+

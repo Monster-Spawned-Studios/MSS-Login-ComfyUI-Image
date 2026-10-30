@@ -1,68 +1,81 @@
 # Production Docker Compose for ComfyUI with MSS-Login
-# Hardware-agnostic: does not assume a specific GPU backend.
-# Runtime entrypoint auto-detects NVIDIA CUDA (cu130/cu128), AMD ROCm, Intel Arc/XPU, Apple Metal MPS, or CPU
-# and automatically installs the matching PyTorch dependencies for ComfyUI.
+# Hardware-agnostic: supports NVIDIA CUDA, AMD ROCm, Intel Arc/XPU, Apple Metal, or CPU.
+# Sub-compose companion scripts available via hwaccel.ml.yml (modeled after Immich v3.3.5).
+
+name: comfyui-mss-server
 
 services:
   comfyui:
+    init: true
+    # --- Immich-Style Hardware Acceleration Companion (Optional) ---
+    # Uncomment ONE of the following extends blocks to use companion sub-compose files:
+    # extends:
+    #   file: hwaccel.ml.yml
+    #   service: cuda    # Options: [cuda, rocm, cpu]
+
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      target: ${IMAGE_TARGET:-auto}
       args:
         ACCELERATOR: ${ACCELERATOR:-auto}
+        CUDA_VERSION: ${CUDA_VERSION:-cu128}
+        ROCM_VERSION: ${ROCM_VERSION:-rocm6.2.4}
     image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:latest}
     container_name: comfyui-mss-login
     restart: unless-stopped
+    shm_size: ${SHM_SIZE:-4g}
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "${HOST:-127.0.0.1}:${PORT:-8188}:${PORT:-8188}/tcp"
     environment:
-      # MSS-Login Security and Configuration
       - HOST_BASE_URL=${HOST_BASE_URL:-http://${HOST:-127.0.0.1}:${PORT:-8188}}
       - SECRET_KEY=${SECRET_KEY:-}
       - MSS_LOGIN_DATA_DIR=${MSS_LOGIN_DATA_DIR:-/data/mss-login}
       - CPE_EMBEDDED_CONVERT=${CPE_EMBEDDED_CONVERT:-true}
       - EXPERIMENTAL_LOGIN_BACKGROUND=${EXPERIMENTAL_LOGIN_BACKGROUND:-true}
       - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-}
+      - WEBAUTHN_RP_NAME=${WEBAUTHN_RP_NAME:-ComfyUI MSS-Login}
       - WEBAUTHN_ORIGINS=${WEBAUTHN_ORIGINS:-}
       - PYTHONUNBUFFERED=1
-      # Hardware & Driver Auto-Detection (auto | cuda | rocm | xpu | metal | cpu)
       - DEVICE_TYPE=${DEVICE_TYPE:-auto}
       - USE_CPU=${USE_CPU:-0}
-      # CLI Args for ComfyUI
-      - CLI_ARGS=--listen ${HOST:-127.0.0.1} --port ${PORT:-8188}
+      - CLI_ARGS=--listen 0.0.0.0 --port ${PORT:-8188}
     volumes:
-      # Persistent MSS-Login database, secrets, backgrounds, and user workflows
-      - mss_data:${MSS_LOGIN_DATA_DIR:-/data/mss-login}
-      # ComfyUI assets (models, outputs, inputs, user settings)
-      - comfy_models:/app/ComfyUI/models
-      - comfy_output:/app/ComfyUI/output
-      - comfy_input:/app/ComfyUI/input
-      - comfy_user:/app/ComfyUI/user
-      # Persist virtual environment so runtime-detected PyTorch wheels survive container restarts
-      - comfy_venv:/app/ComfyUI/.venv
+      - ${COMFYUI_MSS_DATA_DIR:-mss_login_data}:${MSS_LOGIN_DATA_DIR:-/data/mss-login}
+      - ${COMFYUI_MODELS_DIR:-comfyui_models}:/app/ComfyUI/models
+      - ${COMFYUI_OUTPUT_DIR:-comfyui_output}:/app/ComfyUI/output
+      - ${COMFYUI_INPUT_DIR:-comfyui_input}:/app/ComfyUI/input
+      - ${COMFYUI_USER_DIR:-comfyui_user}:/app/ComfyUI/user
+      - ${COMFYUI_CUSTOM_NODES_DIR:-comfyui_custom_nodes}:/app/ComfyUI/custom_nodes
+      - ${COMFYUI_VENV_DIR:-comfyui_venv}:/app/ComfyUI/.venv
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8188/mss-login/login"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:${PORT:-8188}/mss-login/login"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
 
 volumes:
-  mss_data:
+  mss_login_data:
     driver: local
-    name: comfyui_mss_data
-  comfy_models:
+    name: mss_login_data
+  comfyui_models:
     driver: local
     name: comfyui_models
-  comfy_output:
+  comfyui_output:
     driver: local
     name: comfyui_output
-  comfy_input:
+  comfyui_input:
     driver: local
     name: comfyui_input
-  comfy_user:
+  comfyui_user:
     driver: local
     name: comfyui_user
-  comfy_venv:
+  comfyui_custom_nodes:
+    driver: local
+    name: comfyui_custom_nodes
+  comfyui_venv:
     driver: local
     name: comfyui_venv

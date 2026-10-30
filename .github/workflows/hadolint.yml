@@ -1,0 +1,107 @@
+# Hadolint Dockerfile Linter for GitHub Actions
+name: Dockerfile Lint (Hadolint)
+
+on:
+  push:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - ".hadolint.yaml"
+      - ".github/workflows/hadolint.yml"
+  pull_request:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - ".hadolint.yaml"
+      - ".github/workflows/hadolint.yml"
+  schedule:
+    # Weekly on Mondays at 12:00 America/Denver (18:00 UTC)
+    - cron: "0 18 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  hadolint:
+    name: Hadolint Dockerfile Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        shell: bash
+        run: mkdir -p ci-reports/hadolint
+
+      - name: Run Hadolint via Official Action
+        id: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        continue-on-error: true
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+          output-file: ci-reports/hadolint/hadolint-report.txt
+
+      - name: Generate Scan Summary and Verify Status
+        id: summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          hadolint_res="${{ steps.hadolint.outcome }}"
+          echo "hadolint_res=${hadolint_res}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "ComfyUI-MSS-Login Deployment — Hadolint Dockerfile Scan Summary"
+            echo "============================================================="
+            echo "Ref: ${{ github.ref_name }}"
+            echo "SHA: ${{ github.sha }}"
+            echo "Hadolint Result: ${hadolint_res}"
+            echo
+            if [ -f "ci-reports/hadolint/hadolint-report.txt" ]; then
+              cat "ci-reports/hadolint/hadolint-report.txt"
+            fi
+          } > ci-reports/hadolint/SUMMARY.txt
+
+          if [ "${hadolint_res}" != "success" ]; then
+            echo "all_ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "all_ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Hadolint Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hadolint-scan-reports
+          path: ci-reports/hadolint
+          retention-days: 7
+
+      - name: Enforce scan result
+        if: steps.summary.outputs.all_ok != 'true'
+        shell: bash
+        run: |
+          echo "::error::Hadolint detected issues in Dockerfile!"
+          exit 1
+
+  notify:
+    name: Notify via ntfy
+    needs: hadolint
+    if: always()
+    uses: ./.github/workflows/ntfy-notify-reusable.yml
+    secrets: inherit
+    with:
+      title: ${{ needs.hadolint.result == 'success' && 'MSS-Login Deploy Hadolint — All checks passed' || 'MSS-Login Deploy Hadolint — Issues found' }}
+      message: |
+        === Hadolint Dockerfile Lint Results ===
+        Repository: comfyui-mss-login-docker
+        Status: ${{ needs.hadolint.result == 'success' && 'PASS (clean)' || 'FAIL (Dockerfile lint issues detected)' }}
+        Ref: ${{ github.ref_name }}
+        Commit: ${{ github.sha }}
+      priority: ${{ needs.hadolint.result == 'success' && '3' || '5' }}
+      tags: ${{ needs.hadolint.result == 'success' && 'white_check_mark,whale,memo' || 'warning,whale,memo' }}
+      ref_name: ${{ github.ref_name }}
+      attachment_artifact: hadolint-scan-reports
+      attachment_filename: hadolint-scan-reports.zip
+      skip_if_unconfigured: true
