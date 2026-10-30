@@ -15,39 +15,43 @@ The multi-stage `deploy/Dockerfile` provides specialized sub-image targets while
 | **AMD ROCm** | `rocm` | `monster-spawned-studios/comfyui-mss-login:rocm` | Linux with AMD Radeon / Instinct GPUs (ROCm 6.2.4) |
 | **CPU Mode** | `cpu` | `monster-spawned-studios/comfyui-mss-login:cpu` | macOS (Docker Desktop), CPU-only servers, CI/CD |
 
-## Immich-Style Hardware Acceleration Companion Scripts
+## Hardware Backend Selection (GitOps & Portainer Ready)
 
-Following the companion configuration architecture popularized by Immich (see [Immich v3.3.5](https://github.com/immich-app/immich/releases/tag/v3.3.5) with `hwaccel.ml.yml`), hardware-specific configurations are split into companion sub-compose scripts so the main stack remains clean and portable:
+Hardware acceleration is configured **entirely through environment variables** using Docker Compose profiles. **You do not need to edit or uncomment sections in YAML files**, making this 100% compatible with Portainer EE's GitOps repository deployment.
 
-- **`hwaccel.ml.yml`**: Unified companion configuration with `cuda`, `rocm`, and `cpu` services.
-- **`hwaccel.nvidia.yml`**: Dedicated overlay for NVIDIA CUDA GPU devices and drivers.
-- **`hwaccel.rocm.yml`**: Dedicated overlay for AMD ROCm (`/dev/kfd` and `/dev/dri`).
-- **`hwaccel.cpu.yml`**: Dedicated overlay for lightweight CPU execution.
+Set the `COMPOSE_PROFILES` environment variable in Portainer's **Environment variables** tab (or in your `.env` file):
 
-### Usage with `extends` (Portainer Web UI or Docker Compose)
+| `COMPOSE_PROFILES` | Target Hardware | Image Tag | Docker Passthrough Activated |
+|---|---|---|---|
+| `auto` (or unset) | Universal Auto-Detect | `:latest` / `:auto` | Runtime hardware auto-detection on boot |
+| `cuda` (or `nvidia`) | NVIDIA CUDA GPU | `:nvidia` | NVIDIA GPU driver passthrough (`driver: nvidia, capabilities: [gpu]`) |
+| `rocm` (or `amd`) | AMD ROCm GPU | `:rocm` | AMD device passthrough (`/dev/kfd`, `/dev/dri`, `video`/`render` groups) |
+| `cpu` | CPU Execution Mode | `:cpu` | CPU flags enabled (`--cpu`), zero GPU driver dependencies |
 
-In `portainer-stack.yml` or `docker-compose.yml`, uncomment the companion `extends` block:
+> [!TIP]
+> **Combining Profiles**: To enable the optional Cloudflare Tunnel alongside hardware acceleration, separate profiles with a comma, for example: `COMPOSE_PROFILES=cuda,tunnel`.
 
-```yaml
-services:
-  comfyui-server:
-    extends:
-      file: hwaccel.ml.yml
-      service: cuda    # Options: [cuda, rocm, cpu]
-```
+## User Scripts & Custom Node Auto-Downloader
 
-### Usage with Docker Compose Multi-File Overlays (CLI)
+Before ComfyUI launches, `entrypoint.sh` executes the user-scripts hook (`user-scripts/pre-start.sh`). This enables automatic cloning of custom nodes from Git repositories, batch model downloads, and dependency installation on startup.
 
-```bash
-# NVIDIA CUDA (Linux / Windows 11 WSL2)
-docker compose -f portainer-stack.yml -f hwaccel.nvidia.yml up -d
+The `user-scripts/` directory contains:
+- **`pre-start.sh`**: Main boot orchestrator running the scripts below in order.
+- **`01-download-models.sh`**: Downloads models listed in `models-to-download.txt` into their corresponding folders (checkpoints, loras, vae, etc.) with checksum validation.
+- **`02-download-nodes.sh`**: Clones and updates custom node Git repositories listed in `custom-nodes.txt` (including branch/tag `@ref` support).
+- **`03-install-node-deps.sh`**: Automatically detects and installs Python dependencies for newly cloned nodes using fast `uv`.
+- **`04-set-permissions.sh`**: Sets volume permissions so non-root containers and the host user can access output and models cleanly.
+- **`custom-nodes.txt`**: One Git URL per line (e.g. `https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login`).
+- **`models-to-download.txt`**: Model download URLs and target folder classifications.
 
-# AMD ROCm (Linux)
-docker compose -f portainer-stack.yml -f hwaccel.rocm.yml up -d
+You can customize these scripts by binding a host directory to `/app/user-scripts` via `COMFYUI_USER_SCRIPTS_DIR=./user-scripts` in your `.env`.
 
-# CPU Mode (macOS / CPU-only)
-docker compose -f portainer-stack.yml -f hwaccel.cpu.yml up -d
-```
+## Caching (Hugging Face & PyTorch)
+
+To avoid redownloading models and transformer weights on restart or rebuild, dedicated persistent caching directories are mapped:
+- **Hugging Face Cache**: `${COMFYUI_CACHE_DIR:-comfyui_cache}/huggingface` (`HF_HOME=/data/cache/huggingface`)
+- **PyTorch Cache**: `${COMFYUI_CACHE_DIR:-comfyui_cache}/torch` (`TORCH_HOME=/data/cache/torch`)
+- **General Cache**: `${COMFYUI_CACHE_DIR:-comfyui_cache}` (`XDG_CACHE_HOME=/data/cache`)
 
 ## Portainer Deployment & GitOps Automation
 
@@ -81,7 +85,7 @@ Portainer Enterprise Edition (EE) and Business Edition provide native **GitOps**
 2. Select the **Repository** build method.
 3. Configure repository settings:
    - **Repository URL**: `https://git.monsterspawned.studio/Monster-Spawned-Studios/comfyui-mss-login-docker.git` (or your repository/fork URL).
-   - **Repository reference**: `refs/heads/main` (or your target branch/tag).
+   - **Repository reference**: `refs/heads/production` (primary deployment branch).
    - **Authentication**: Enable and supply your Git credentials / Personal Access Token (PAT) if the repository is private.
    - **Compose path**: `portainer-stack.yml`
    - **Additional paths (Multi-File Compose)**: If you prefer using companion overlays instead of editing YAML `extends`, click **Add file** under *Additional paths* and enter the matching overlay (e.g. `hwaccel.nvidia.yml`, `hwaccel.rocm.yml`, or `hwaccel.cpu.yml`). Portainer merges these files in order just like `docker compose -f ... -f ...`.
@@ -110,8 +114,9 @@ For instantaneous zero-delay deployments when code or configurations are pushed 
   - Save the webhook.
 - Whenever a commit is pushed to the target branch, your Git server sends a POST request to Portainer, triggering an immediate SHA comparison, repository pull, and stack redeployment.
 
-#### 4. Force Redeployment & Re-pulling Images
-- **Re-pull image**: Enable this toggle in Portainer so that during every GitOps redeployment, newer container images (such as floating tags like `:latest` or `:nvidia`) are automatically pulled from the registry even if the compose text itself did not change.
+#### 4. Force Redeployment & Image Pull Policy
+- **Image Pull Policy (`PULL_POLICY`)**: By default, `PULL_POLICY` is set to `build` (`pull_policy: ${PULL_POLICY:-build}`), instructing Docker Compose to build the container from `deploy/Dockerfile` and skip trying to pull an unauthenticated/nonexistent image from Docker Hub during Portainer's pre-deploy compose pull step. If using pre-built images from a container registry (e.g., Docker Hub or GitHub Packages `ghcr.io`), set `PULL_POLICY=always` (or `missing`) and configure your image path in `COMFYUI_IMAGE`.
+- **Re-pull image**: Enable this toggle in Portainer if you configure pre-built images (`PULL_POLICY=always`) so that newer container images (such as floating tags like `:latest` or `:nvidia`) are automatically pulled during every GitOps trigger.
 - **Force redeployment**: When enabled, Portainer redeploys the stack on every trigger, ensuring local environment state does not drift from Git source-of-truth.
 - If Watchtower is also deployed, image auto-updates will honor the container label:
   `com.centurylinklabs.watchtower.enable=true`.
