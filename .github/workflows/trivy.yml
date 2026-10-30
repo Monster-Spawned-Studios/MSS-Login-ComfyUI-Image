@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
   security-events: write
 
 jobs:
@@ -35,21 +36,93 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Prepare reports directory
+        shell: bash
+        run: mkdir -p ci-reports/trivy
+
       - name: Run Trivy Config Scan (Dockerfile & Compose misconfigurations)
+        id: trivy_config
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           scan-type: "config"
           scan-ref: "."
           severity: "CRITICAL,HIGH"
           exit-code: "1"
+          output: "ci-reports/trivy/trivy-config-report.txt"
           hide-progress: false
 
       - name: Run Trivy Filesystem & Secret Scan
+        id: trivy_fs
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           scan-type: "fs"
           scan-ref: "."
           scanners: "vuln,secret"
           severity: "CRITICAL,HIGH"
           exit-code: "1"
+          output: "ci-reports/trivy/trivy-fs-report.txt"
           hide-progress: false
+
+      - name: Generate Scan Summary and Verify Status
+        id: summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          config_res="${{ steps.trivy_config.outcome }}"
+          fs_res="${{ steps.trivy_fs.outcome }}"
+
+          echo "config_res=${config_res}" >> "$GITHUB_OUTPUT"
+          echo "fs_res=${fs_res}" >> "$GITHUB_OUTPUT"
+
+          all_ok="true"
+          if [ "${config_res}" != "success" ] || [ "${fs_res}" != "success" ]; then
+            all_ok="false"
+          fi
+          echo "all_ok=${all_ok}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "ComfyUI-MSS-Login Deployment — Trivy Scan Summary"
+            echo "================================================"
+            echo "Ref: ${{ github.ref_name }}"
+            echo "SHA: ${{ github.sha }}"
+            echo "Config Scan (Misconfigurations): ${config_res}"
+            echo "Filesystem & Secrets Scan: ${fs_res}"
+          } > ci-reports/trivy/SUMMARY.txt
+
+      - name: Upload Trivy Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-reports
+          path: ci-reports/trivy
+          retention-days: 7
+
+      - name: Enforce scan result
+        if: steps.summary.outputs.all_ok != 'true'
+        shell: bash
+        run: |
+          echo "::error::Trivy security scan identified high/critical findings or misconfigurations!"
+          exit 1
+
+  notify:
+    name: Notify via ntfy
+    needs: trivy-scan
+    if: always()
+    uses: ./.github/workflows/ntfy-notify-reusable.yml
+    secrets: inherit
+    with:
+      title: ${{ needs.trivy-scan.result == 'success' && 'MSS-Login Deploy Trivy — All checks passed' || 'MSS-Login Deploy Trivy — Issues found' }}
+      message: |
+        === Trivy Security Scan Results ===
+        Repository: comfyui-mss-login-docker
+        Status: ${{ needs.trivy-scan.result == 'success' && 'PASS (clean)' || 'FAIL (vulnerabilities or misconfigurations detected)' }}
+        Ref: ${{ github.ref_name }}
+        Commit: ${{ github.sha }}
+      priority: ${{ needs.trivy-scan.result == 'success' && '3' || '5' }}
+      tags: ${{ needs.trivy-scan.result == 'success' && 'white_check_mark,lock,whale' || 'warning,lock,whale' }}
+      ref_name: ${{ github.ref_name }}
+      attachment_artifact: trivy-scan-reports
+      attachment_filename: trivy-scan-reports.zip
+      skip_if_unconfigured: true

@@ -35,19 +35,97 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Trivy via Official Docker Image
+      - name: Prepare reports directory
+        shell: bash
+        run: mkdir -p ci-reports/trivy
+
+      - name: Run Trivy Config Scan (Dockerfile & Compose misconfigurations)
+        id: trivy_config
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           echo "[trivy] Running configuration audit on Dockerfile & Compose files..."
           docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:latest config \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
-            /workspace
+            /workspace > ci-reports/trivy/trivy-config-report.txt 2>&1
+          status=$?
+          set -e
+          cat ci-reports/trivy/trivy-config-report.txt
+          if [ "$status" -eq 0 ]; then
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          fi
 
+      - name: Run Trivy Filesystem & Secret Scan
+        id: trivy_fs
+        shell: bash
+        run: |
+          set +e
           echo "[trivy] Running filesystem vulnerability and secret audit..."
           docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:latest fs \
             --scanners vuln,secret \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
-            /workspace
+            /workspace > ci-reports/trivy/trivy-fs-report.txt 2>&1
+          status=$?
+          set -e
+          cat ci-reports/trivy/trivy-fs-report.txt
+          if [ "$status" -eq 0 ]; then
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package reports and notify via ntfy
+        if: always()
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          CONFIG_RESULT: ${{ steps.trivy_config.outputs.outcome }}
+          FS_RESULT: ${{ steps.trivy_fs.outputs.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-reports/trivy
+          {
+            echo "ComfyUI-MSS-Login Deployment — Trivy Scan Summary"
+            echo "================================================"
+            echo "Ref: ${GITHUB_REF_NAME:-unknown}"
+            echo "SHA: ${GITHUB_SHA:-unknown}"
+            echo "Config Scan (Misconfigurations): ${CONFIG_RESULT:-unknown}"
+            echo "Filesystem & Secrets Scan: ${FS_RESULT:-unknown}"
+          } > ci-reports/trivy/SUMMARY.txt
+
+          archive="ci-reports/trivy/trivy-scan-reports.tar.gz"
+          tar -C ci-reports/trivy -czf "${archive}" . 2>/dev/null || true
+
+          all_ok="true"
+          if [ "${CONFIG_RESULT:-}" != "success" ] || [ "${FS_RESULT:-}" != "success" ]; then
+            all_ok="false"
+          fi
+
+          if [ "$all_ok" = "true" ]; then
+            export TITLE="MSS-Login Deploy Trivy — All checks passed"
+            export PRIORITY="3"
+            export TAGS="white_check_mark,lock,whale"
+          else
+            export TITLE="MSS-Login Deploy Trivy — Issues found"
+            export PRIORITY="5"
+            export TAGS="warning,lock,whale"
+          fi
+
+          export MESSAGE="$(printf '=== Trivy Security Scan Results ===\nRepository: comfyui-mss-login-docker\nConfig Scan: %s\nFilesystem & Secrets: %s\nReport: attached %s\n' \
+            "${CONFIG_RESULT:-unknown}" "${FS_RESULT:-unknown}" "$(basename "$archive")")"
+          export ATTACHMENT_PATH="${archive}"
+          export ATTACHMENT_FILENAME="$(basename "$archive")"
+          export SKIP_IF_UNCONFIGURED="true"
+          bash scripts/ci/ntfy_publish.sh
+
+          # Fail the job if any scan step failed (ntfy already sent).
+          if [ "$all_ok" != "true" ]; then
+            exit 1
+          fi
