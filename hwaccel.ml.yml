@@ -1,0 +1,63 @@
+# Hardware Acceleration Configuration for ComfyUI MSS-Login
+# Modeled after Immich's hwaccel.ml.yml companion structure:
+# https://github.com/immich-app/immich/releases/tag/v3.3.5
+#
+# Usage in main compose file (portainer-stack.yml or docker-compose.yml):
+#   extends:
+#     file: hwaccel.ml.yml
+#     service: cuda    # Options: [cuda, rocm, cpu]
+
+name: comfyui-mss-hwaccel
+
+services:
+  cuda:
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:nvidia}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: nvidia
+      args:
+        ACCELERATOR: cuda
+        CUDA_VERSION: ${CUDA_VERSION:-cu128}
+    environment:
+      DEVICE_TYPE: cuda
+      NVIDIA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+
+  rocm:
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:rocm}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: rocm
+      args:
+        ACCELERATOR: rocm
+        ROCM_VERSION: ${ROCM_VERSION:-rocm6.2.4}
+    environment:
+      DEVICE_TYPE: rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - "video"
+      - "render"
+
+  cpu:
+    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:cpu}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: cpu
+      args:
+        ACCELERATOR: cpu
+    environment:
+      DEVICE_TYPE: cpu
+      USE_CPU: 1
+
