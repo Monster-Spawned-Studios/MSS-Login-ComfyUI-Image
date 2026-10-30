@@ -1,0 +1,106 @@
+# Hadolint Dockerfile Linter for Gitea Actions
+# Compatible with Gitea act-runner Docker environments
+name: Dockerfile Lint (Hadolint)
+
+on:
+  push:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - ".hadolint.yaml"
+      - ".gitea/workflows/hadolint.yml"
+  pull_request:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - ".hadolint.yaml"
+      - ".gitea/workflows/hadolint.yml"
+  schedule:
+    # Weekly on Mondays at 12:00 America/Denver (18:00 UTC)
+    - cron: "0 18 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hadolint:
+    name: Hadolint Dockerfile Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        shell: bash
+        run: mkdir -p ci-reports/hadolint
+
+      - name: Run Hadolint via Official Docker Image
+        id: hadolint
+        shell: bash
+        run: |
+          set +e
+          echo "[hadolint] Running Hadolint linter on Dockerfile..."
+          docker run --rm -v "${GITHUB_WORKSPACE}:/work" hadolint/hadolint:latest hadolint -c /work/.hadolint.yaml /work/Dockerfile > ci-reports/hadolint/hadolint-report.txt 2>&1
+          status=$?
+          set -e
+          cat ci-reports/hadolint/hadolint-report.txt
+          if [ "$status" -eq 0 ]; then
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package reports and notify via ntfy
+        if: always()
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          HADOLINT_RESULT: ${{ steps.hadolint.outputs.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-reports/hadolint
+          {
+            echo "ComfyUI-MSS-Login Deployment — Hadolint Scan Summary"
+            echo "==================================================="
+            echo "Ref: ${GITHUB_REF_NAME:-unknown}"
+            echo "SHA: ${GITHUB_SHA:-unknown}"
+            echo "Hadolint Result: ${HADOLINT_RESULT:-unknown}"
+            echo
+            if [ -f "ci-reports/hadolint/hadolint-report.txt" ]; then
+              cat "ci-reports/hadolint/hadolint-report.txt"
+            fi
+          } > ci-reports/hadolint/SUMMARY.txt
+
+          archive="ci-reports/hadolint/hadolint-scan-reports.tar.gz"
+          tar -C ci-reports/hadolint -czf "${archive}" . 2>/dev/null || true
+
+          all_ok="true"
+          if [ "${HADOLINT_RESULT:-}" != "success" ]; then
+            all_ok="false"
+          fi
+
+          if [ "$all_ok" = "true" ]; then
+            export TITLE="MSS-Login Deploy Hadolint — All checks passed"
+            export PRIORITY="3"
+            export TAGS="white_check_mark,whale,memo"
+          else
+            export TITLE="MSS-Login Deploy Hadolint — Issues found"
+            export PRIORITY="5"
+            export TAGS="warning,whale,memo"
+          fi
+
+          export MESSAGE="$(printf '=== Hadolint Dockerfile Lint Results ===\nRepository: comfyui-mss-login-docker\nStatus: %s\nReport: attached %s\n' \
+            "${HADOLINT_RESULT:-unknown}" "$(basename "$archive")")"
+          export ATTACHMENT_PATH="${archive}"
+          export ATTACHMENT_FILENAME="$(basename "$archive")"
+          export SKIP_IF_UNCONFIGURED="true"
+          bash scripts/ci/ntfy_publish.sh
+
+          # Fail the job if hadolint failed (ntfy already sent).
+          if [ "$all_ok" != "true" ]; then
+            exit 1
+          fi

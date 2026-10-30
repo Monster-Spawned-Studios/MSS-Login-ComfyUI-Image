@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast Python packaging & tool management
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 # Install hermetic Python 3.13 and official Comfy-CLI
@@ -79,7 +80,7 @@ ENV MSS_LOGIN_DATA_DIR=/data/mss-login \
     DEVICE_TYPE=auto
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
-    CMD curl -f http://127.0.0.1:8188/mss-login/login || exit 1
+    CMD ["curl", "-f", "http://127.0.0.1:8188/mss-login/login"]
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 
