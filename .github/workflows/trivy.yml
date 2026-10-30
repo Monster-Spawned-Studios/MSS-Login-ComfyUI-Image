@@ -1,0 +1,55 @@
+# Trivy Vulnerability & Misconfiguration Scanner for GitHub Actions
+name: Security Scan (Trivy)
+
+on:
+  push:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - "*.yml"
+      - "*.yaml"
+      - ".env.example"
+      - ".github/workflows/trivy.yml"
+  pull_request:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - "*.yml"
+      - "*.yaml"
+      - ".env.example"
+      - ".github/workflows/trivy.yml"
+  schedule:
+    # Weekly on Mondays at 12:00 America/Denver (18:00 UTC)
+    - cron: "0 18 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Config Scan (Dockerfile & Compose misconfigurations)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "config"
+          scan-ref: "."
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          hide-progress: false
+
+      - name: Run Trivy Filesystem & Secret Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "vuln,secret"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          hide-progress: false

@@ -1,0 +1,53 @@
+# Trivy Vulnerability & Misconfiguration Scanner for Gitea Actions
+# Compatible with Gitea act-runner Docker environments
+name: Security Scan (Trivy)
+
+on:
+  push:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - "*.yml"
+      - "*.yaml"
+      - ".env.example"
+      - ".gitea/workflows/trivy.yml"
+  pull_request:
+    branches: [main, production, development]
+    paths:
+      - "Dockerfile"
+      - "*.yml"
+      - "*.yaml"
+      - ".env.example"
+      - ".gitea/workflows/trivy.yml"
+  schedule:
+    # Weekly on Mondays at 12:00 America/Denver (18:00 UTC)
+    - cron: "0 18 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trivy-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy via Official Docker Image
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[trivy] Running configuration audit on Dockerfile & Compose files..."
+          docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:latest config \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            /workspace
+
+          echo "[trivy] Running filesystem vulnerability and secret audit..."
+          docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:latest fs \
+            --scanners vuln,secret \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            /workspace
