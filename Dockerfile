@@ -1,7 +1,11 @@
-# Hardware-agnostic multi-stage Dockerfile for ComfyUI with MSS-Login
-# Base: Ubuntu 24.04 LTS (Noble Numbat) — does NOT assume a specific GPU backend.
-# Supports NVIDIA CUDA (cu130 / cu128), AMD ROCm, Intel Arc/XPU, Apple Silicon Metal (M-Series), and CPU.
-# Uses official Comfy-CLI and Astral UV for reproducible ComfyUI deployment and automatic runtime PyTorch provisioning.
+# Multi-stage hardware-optimized Dockerfile for ComfyUI with MSS-Login
+# Base: Ubuntu 24.04 LTS (Noble Numbat)
+#
+# Dedicated Sub-Image Targets:
+#   - cpu:    Pre-baked with PyTorch CPU wheels (macOS, CPU-only servers, CI/CD)
+#   - nvidia: Pre-baked with PyTorch NVIDIA CUDA wheels (cu128 / cu130)
+#   - rocm:   Pre-baked with PyTorch AMD ROCm wheels (rocm6.2.4)
+#   - auto:   Universal hardware auto-detecting image (default)
 
 ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE} AS base
@@ -11,7 +15,9 @@ ARG CUDA_VERSION=auto
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
+    UV_INSTALL_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    PATH="/app/ComfyUI/.venv/bin:/root/.local/bin:/usr/local/bin:$PATH"
 
 # Install system dependencies (libsqlcipher-dev, graphics, media libraries)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast Python packaging & tool management
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 # Install hermetic Python 3.13 and official Comfy-CLI
 RUN uv python install 3.13 \
@@ -34,22 +40,8 @@ RUN uv python install 3.13 \
 
 WORKDIR /app
 
-# Install latest stable ComfyUI core.
-# When ACCELERATOR=auto (default), install ComfyUI core without assuming a GPU backend;
-# entrypoint.sh detects the host GPU at runtime and installs the matching PyTorch wheels.
-RUN if [ "$ACCELERATOR" = "m-series" ] || [ "$ACCELERATOR" = "metal" ]; then \
-        comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --m-series --fast-deps; \
-    elif [ "$ACCELERATOR" = "nvidia" ] || [ "$ACCELERATOR" = "cuda" ]; then \
-        if [ "$CUDA_VERSION" != "auto" ] && [ -n "$CUDA_VERSION" ]; then \
-            comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --nvidia --cuda-version ${CUDA_VERSION} --fast-deps; \
-        else \
-            comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --nvidia --fast-deps; \
-        fi; \
-    elif [ "$ACCELERATOR" = "amd" ] || [ "$ACCELERATOR" = "rocm" ]; then \
-        comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --amd --fast-deps; \
-    else \
-        comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps; \
-    fi
+# Install ComfyUI core
+RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps
 
 ENV VIRTUAL_ENV=/app/ComfyUI/.venv \
     PATH="/app/ComfyUI/.venv/bin:$PATH"
@@ -59,7 +51,7 @@ COPY . /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
 WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
-# Install non-backend-specific extension dependencies; PyTorch backend is reconciled by entrypoint.sh
+# Install non-backend-specific extension dependencies
 RUN uv pip install -r requirements.txt \
     && (playwright install --with-deps chromium || true)
 
@@ -67,6 +59,16 @@ RUN uv pip install -r requirements.txt \
 COPY deploy/entrypoint.sh /app/entrypoint.sh
 COPY deploy/update.sh /app/update.sh
 RUN chmod +x /app/entrypoint.sh /app/update.sh
+
+# Create dedicated non-root user 'comfy' and data directory with proper ownership
+RUN mkdir -p /data/mss-login \
+    && (groupadd -r -g 1000 comfy || true) \
+    && (useradd -m -u 1000 -g 1000 -s /bin/bash comfy || true) \
+    && (groupadd -r render 2>/dev/null || true) \
+    && (usermod -aG video,render comfy 2>/dev/null || usermod -aG video comfy 2>/dev/null || true) \
+    && (chown -R 1000:1000 /app /data/mss-login /opt/uv-python 2>/dev/null || true)
+
+USER comfy
 
 WORKDIR /app/ComfyUI
 
@@ -76,4 +78,51 @@ ENV MSS_LOGIN_DATA_DIR=/data/mss-login \
     CPE_EMBEDDED_CONVERT=true \
     DEVICE_TYPE=auto
 
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD curl -f http://127.0.0.1:8188/mss-login/login || exit 1
+
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+# ------------------------------------------------------------------------------
+# Sub-Image Target: CPU (macOS, CPU-only servers, CI/CD testing)
+# ------------------------------------------------------------------------------
+FROM base AS cpu
+ENV DEVICE_TYPE=cpu \
+    USE_CPU=1
+RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
+        --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch torchvision torchaudio \
+    && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend
+
+# ------------------------------------------------------------------------------
+# Sub-Image Target: NVIDIA (Linux & Windows 11 WSL2 with NVIDIA CUDA GPU)
+# ------------------------------------------------------------------------------
+FROM base AS nvidia
+ARG CUDA_VERSION=cu128
+ENV DEVICE_TYPE=cuda \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
+        --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
+        --index-url https://download.pytorch.org/whl/${CUDA_VERSION} \
+        torch torchvision torchaudio \
+    && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend
+
+# ------------------------------------------------------------------------------
+# Sub-Image Target: ROCM (Linux with AMD ROCm GPU)
+# ------------------------------------------------------------------------------
+FROM base AS rocm
+ARG ROCM_VERSION=rocm6.2.4
+ENV DEVICE_TYPE=rocm
+RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
+        --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
+        --index-url https://download.pytorch.org/whl/${ROCM_VERSION} \
+        torch torchvision torchaudio \
+    && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend
+
+# ------------------------------------------------------------------------------
+# Sub-Image Target: AUTO (Universal hardware auto-detecting image - Default)
+# ------------------------------------------------------------------------------
+FROM base AS auto
+ENV DEVICE_TYPE=auto
