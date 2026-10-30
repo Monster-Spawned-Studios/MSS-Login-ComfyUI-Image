@@ -13,6 +13,14 @@ MSS_DIR="/app/ComfyUI/custom_nodes/ComfyUI-MSS-Login"
 
 echo "[comfyui-deploy] Initializing ComfyUI container runtime ($OS / $ARCH, DEVICE_TYPE=$DEVICE_TYPE)..."
 
+# Execute pre-start user scripts if available (install custom nodes, download models, configure packages)
+USER_SCRIPTS_DIR="${COMFYUI_USER_SCRIPTS_DIR:-/app/user-scripts}"
+if [[ -f "${USER_SCRIPTS_DIR}/pre-start.sh" ]]; then
+    echo "[comfyui-deploy] Running user pre-start scripts from ${USER_SCRIPTS_DIR}..."
+    chmod +x "${USER_SCRIPTS_DIR}"/*.sh 2>/dev/null || true
+    bash "${USER_SCRIPTS_DIR}/pre-start.sh" || echo "[comfyui-deploy] User pre-start scripts completed with exit code $? (continuing startup)"
+fi
+
 # Use MSS-Login's hardware detector (utils/install_deps.py) to determine the target PyTorch backend & wheel index
 read -r TARGET_BACKEND TARGET_INDEX TARGET_REQ < <(
     python - <<'PY'

@@ -1,0 +1,36 @@
+# ============================================================
+# Custom ComfyUI nodes to clone on container start
+# One Git repository URL per line. Lines starting with # are ignored.
+# ============================================================
+#
+# Format:
+#   <git-url>
+#   <git-url>@<ref>
+#
+# When @<ref> is set, the script tries in order:
+#   1. Tag named <ref>
+#   2. Branch named <ref>
+#   3. Repository default (current HEAD)
+#
+# Supported remotes: GitHub, Gitea, GitLab, Codeberg, or any other
+# Git host reachable via https://, http://, git://, ssh://, or git@host:path
+#
+# Examples:
+#   https://github.com/ltdrdata/ComfyUI-Manager
+#   https://github.com/ltdrdata/ComfyUI-Manager@main
+#   https://github.com/user/ComfyUI-SomeNode@v1.0.0
+#   https://gitea.example.com/user/ComfyUI-Node@release
+#   git@github.com:user/ComfyUI-Node.git@main
+#
+# ============================================================
+# Add your nodes below this line
+# ============================================================
+https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login@production
+https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+https://github.com/ltdrdata/ComfyUI-Impact-Subpack
+https://github.com/cubiq/ComfyUI_InstantID
+https://github.com/cubiq/PuLID_ComfyUI
+https://github.com/1038lab/ComfyUI-RMBG
+https://github.com/cubiq/ComfyUI_essentials
+https://github.com/nregret/Comfyui-Anima-Tools
+https://github.com/storyicon/comfyui_segment_anything

@@ -47,8 +47,10 @@ RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install -
 ENV VIRTUAL_ENV=/app/ComfyUI/.venv \
     PATH="/app/ComfyUI/.venv/bin:$PATH"
 
-# Copy MSS-Login extension into custom_nodes
-COPY . /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
+# Auto-download MSS-Login extension into custom_nodes from repository
+ARG MSS_LOGIN_REPO=https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
+ARG MSS_LOGIN_BRANCH=production
+RUN git clone --depth 1 --branch ${MSS_LOGIN_BRANCH} ${MSS_LOGIN_REPO} /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
 WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 
@@ -56,18 +58,19 @@ WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
 RUN uv pip install -r requirements.txt \
     && (playwright install --with-deps chromium || true)
 
-# Provide entrypoint (runtime GPU auto-detection & PyTorch installer) and update script inside container
-COPY deploy/entrypoint.sh /app/entrypoint.sh
-COPY deploy/update.sh /app/update.sh
-RUN chmod +x /app/entrypoint.sh /app/update.sh
+# Provide entrypoint, update script, and default user-scripts inside container
+COPY entrypoint.sh /app/entrypoint.sh
+COPY update.sh /app/update.sh
+COPY user-scripts/ /app/user-scripts/
+RUN chmod +x /app/entrypoint.sh /app/update.sh /app/user-scripts/*.sh 2>/dev/null || true
 
-# Create dedicated non-root user 'comfy' and data directory with proper ownership
-RUN mkdir -p /data/mss-login \
+# Create dedicated non-root user 'comfy', data directory, user-scripts, and cache directories with proper ownership
+RUN mkdir -p /data/mss-login /data/cache/huggingface /data/cache/torch /app/user-scripts \
     && (groupadd -r -g 1000 comfy || true) \
     && (useradd -m -u 1000 -g 1000 -s /bin/bash comfy || true) \
     && (groupadd -r render 2>/dev/null || true) \
     && (usermod -aG video,render comfy 2>/dev/null || usermod -aG video comfy 2>/dev/null || true) \
-    && (chown -R 1000:1000 /app /data/mss-login /opt/uv-python 2>/dev/null || true)
+    && (chown -R 1000:1000 /app /data/mss-login /data/cache /opt/uv-python 2>/dev/null || true)
 
 USER comfy
 
@@ -76,6 +79,10 @@ WORKDIR /app/ComfyUI
 EXPOSE 8188
 
 ENV MSS_LOGIN_DATA_DIR=/data/mss-login \
+    HF_HOME=/data/cache/huggingface \
+    TORCH_HOME=/data/cache/torch \
+    XDG_CACHE_HOME=/data/cache \
+    COMFYUI_USER_SCRIPTS_DIR=/app/user-scripts \
     CPE_EMBEDDED_CONVERT=true \
     DEVICE_TYPE=auto
 

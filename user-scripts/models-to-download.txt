@@ -1,0 +1,151 @@
+# ============================================================
+# Added 2026-10-07 by Grok Bot; updated 2026-10-08 (JANIMA + enable Krea LoRAs/Dasiwa; Q4_0/hard-link notes): models needed by the TMD-LAPTOP-GEN graphs
+# (3D/local, 3D/cloud, 3D/portal, lora_stack). Every URL / Civitai ID below was
+# checked against the HuggingFace tree API or the Civitai API on 2026-10-07.
+# Cloud-only graphs (Tripo / Rodin) need no local models.
+# ============================================================
+
+# ----- Background removal (BiRefNet) - graphs 40-44, 53, portal_3d_local_hy3d2mini, portal_3d_anima_to_hy3d2mini -----
+# Lands as models/background_removal/birefnet.safetensors (the type prefix needs the updated 01-download-models.sh)
+background_removal:https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal/birefnet.safetensors
+
+# ----- Hunyuan3D single-file checkpoints (sources for 3D/tools/split_hunyuan3d_ckpt.py) -----
+# tencent Hunyuan3D-2mini fp16 -> lands as checkpoints/model.fp16.safetensors (generic upstream name).
+# Graph 43 wants checkpoints/hunyuan3d-dit-v2-mini_fp16.safetensors and no repo ships that name.
+# Do NOT rename or delete model.fp16.safetensors (the downloader would fetch it again on the next start).
+# DONE 2026-10-08: both names already hard-link the same inode (deleting either frees 0 bytes and would re-download).
+# If a fresh host only has model.fp16.safetensors, recreate the link:
+#   ln /mnt/tmd-secure/Data/Docker/ComfyUI/models/checkpoints/model.fp16.safetensors /mnt/tmd-secure/Data/Docker/ComfyUI/models/checkpoints/hunyuan3d-dit-v2-mini_fp16.safetensors
+checkpoint:https://huggingface.co/tencent/Hunyuan3D-2mini/resolve/main/hunyuan3d-dit-v2-mini/model.fp16.safetensors
+# Comfy-Org repackaged Hunyuan3D 2.0 (full) and 2.1 (2.1 is the source for graph 42's hy3d21_* files)
+checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.0_repackaged/resolve/main/split_files/hunyuan3d-dit-v2_fp16.safetensors
+checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.1_repackaged/resolve/main/hunyuan_3d_v2.1.safetensors
+# The hy3d2mini_* / hy3d21_* DiT, DINO and VAE files the MultiGPU graphs load are NOT downloadable;
+# make them on the host after these finish, e.g.:
+#   uv run --with safetensors --with numpy --python 3.12 split_hunyuan3d_ckpt.py <models>/checkpoints/model.fp16.safetensors --name hy3d2mini --models-dir <models>
+#   uv run --with safetensors --with numpy --python 3.12 split_hunyuan3d_ckpt.py <models>/checkpoints/hunyuan_3d_v2.1.safetensors --name hy3d21 --models-dir <models>
+
+# ----- Krea 2 GGUF Q4_0 - graph 32 and portal_krea2_gguf_lora_stack (GGUF loaders read models/unet/) -----
+# DONE 2026-10-08: file is already in models/unet/krea2_turbo_bf16-Q4_0.gguf (not in checkpoints/).
+# This line is kept so a fresh host still gets it into unet/ on first start; the downloader skips when present.
+unet:https://huggingface.co/molbal/krea2-gguf/resolve/main/krea2_turbo_bf16-Q4_0.gguf
+
+# ----- Krea 2 style LoRAs + optional Dasiwa (enabled 2026-10-08 for lora_stack placeholders / graph 33) -----
+# Official Comfy-Org Krea 2 style LoRAs (about 470 MB each). Pick these in the YOUR_KREA2_LORA_* slots
+# in graphs 32/33/portal_krea2 (graphs are not edited; choose in the UI). Not tested with turbo Q4_0 GGUF.
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_retroanime.safetensors
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_softwatercolor.safetensors
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_neondrip.safetensors
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_style_reference.safetensors
+# DaSiWa Krea2 DarkDesire V3 Turbo UC, bf16 25.7 GB: the exact file graph 33 names
+# (DasiwaKrea2TurboRaw_darkdesireV3TurboUC_3250905.safetensors = Civitai version 3362930, fileId 3250905).
+# NOT recommended on this laptop (see lora_stack/README.md; ~52 GB RAM peak on load). Enabled so it can download
+# if you still want the template; the updated downloader takes the file name from the Civitai API. Needs CIVITAI_TOKEN.
+# REMOVED 2026-10-08 per user: checkpoint:https://civitai.com/api/download/models/3362930?fileId=3250905
+# Same version, int4 7.37 GB (graph 33's ckpt_name would have to change; ComfyUI int4 support unverified) — leave off:
+# checkpoint:https://civitai.com/api/download/models/3362930?fileId=3251067
+
+# ============================================================
+# Models to auto-download on container start
+# One entry per line. Lines starting with # are ignored.
+# ============================================================
+
+# ----- Direct download links -----
+# https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors
+
+# ----- HuggingFace (repo or specific file) -----
+# Format: hf:user/repo
+# Format: hf:user/repo/filename.safetensors
+# hf:stabilityai/stable-diffusion-xl-base-1.0
+# hf:black-forest-labs/FLUX.1-dev/flux1-dev.safetensors
+
+# ----- CivitAI -----
+# Format: civitai:MODEL_VERSION_ID
+# (Requires CIVITAI_TOKEN environment variable for many models)
+# civitai:123456
+
+# ============================================================
+# Add your models below this line
+# ============================================================
+
+# ----- ACE-Step 1.5 (music) -----
+checkpoint:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/checkpoints/ace_step_1.5_turbo_aio.safetensors
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_turbo.safetensors
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_turbo_bf16.safetensors
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_sft_bf16.safetensors
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_base_bf16.safetensors
+text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_0.6b_ace15.safetensors
+text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_1.7b_ace15.safetensors
+text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_4b_ace15.safetensors
+vae:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/vae/ace_1.5_vae.safetensors
+
+# ----- Anima (image) -----
+diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors
+diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors
+diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-turbo-v1.1.safetensors
+text_encoders:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors
+vae:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors
+# JANIMA Anima v1.0 pruned fp16 (Civitai model version 2967640, fileId 2847103, ~3.90 GB).
+# Lands as checkpoints/JANIMAAnima_v10_2847103.safetensors (API name) for anima/13 + portal_janima_ckpt_t2i.
+# Needs CIVITAI_TOKEN (download redirects to login without it). Verified against Civitai API 2026-10-08.
+checkpoint:https://civitai.com/api/download/models/2967640?fileId=2847103
+
+# ----- Krea 2 (image) -----
+unet:https://huggingface.co/molbal/krea2-gguf/resolve/main/krea2_turbo-Q4_CR.gguf
+text_encoders:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
+diffusion:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors
+diffusion:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors
+
+# ----- Qwen Image 2512 (image) -----
+# Hardware: RTX 4060 8GB (Ada/FP8) + RTX 3050 6GB + 32GB RAM → FP8 + MultiGPU/RAM offload
+# Prefer latest 2512 fp8 over bf16; Lightning 8-step bf16 LoRA for speed without bloating VRAM
+diffusion:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors
+text_encoders:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
+vae:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors
+lora:https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning/resolve/main/Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors
+
+# ----- Qwen Image Edit 2511 (image edit) -----
+# fp8mixed keeps sensitive layers higher-precision (best Comfy-Org quant at ~20GB)
+diffusion:https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors
+lora:https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
+
+# ----- LTXV 2B 0.9.8 distilled-fp8 (video; fits 8GB with short clips) -----
+checkpoint:https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled-fp8.safetensors
+clip:https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors
+
+# ----- Krita AI Diffusion (fits 4060 8GB + 3050 6GB) -----
+# Added 2026-10-08 (t40u). Source of truth: Acly/krita-ai-diffusion v1.53.0 (latest release)
+# ai_diffusion/presets/models.json + backend/resources.py, docs.interstice.cloud/comfyui-setup.
+#
+# STATUS: every Krita model that fits this laptop is ALREADY in models/ under the exact file name and
+# folder the plugin searches for: 53 files, 95.6 GB. All 53 match the upstream byte size (HEAD-checked 2026-10-08),
+# so there is nothing new to download and this section has no active lines.
+# Do NOT paste the plugin's URLs here as active lines. This downloader names files after the URL basename
+# and has no ipadapter:/inpaint:/model_patches:/style_models: prefix, so many would land under the wrong
+# name or folder (e.g. .../image_encoder/model.safetensors, nine different diffusion_pytorch_model.fp16.safetensors).
+# On a fresh host use the plugin's own script instead (exact names and folders, sha256-checked). From the
+# ai_diffusion folder of the plugin RELEASE zip:
+#   python download_models.py --sd15 --sdxl --illu --flux2 --zimage --checkpoints --controlnet --upscalers --backend cuda /mnt/tmd-secure/Data/Docker/ComfyUI
+#   (add --check to verify sha256 of what is already there; --list shows the same 53 files)
+#
+# Krita workloads this box can run (one job at a time; Krita jobs load everything on cuda:0, see KRITA.md):
+#   SD 1.5        dreamshaper_8, serenity_v21 (2.1 GB) + ControlNets / IP-Adapter / Hyper-SD LoRA
+#   SDXL          RealVisXL_V5.0_fp16, zavychromaxl_v80 (6.9 GB) + xinsir union, IP-Adapter, fooocus inpaint
+#   Illustrious   novaAnimeXL_ilV125, NoobAI-XL-Vpred-v1.0 (7.1 GB) + noob ControlNets, noobIPA, clip-vision_vit-g
+#   Flux 2 Klein 4B  flux-2-klein-4b-fp8 (4.1 GB) + Qwen3-4B-Q4_K_M.gguf (2.5 GB) + flux2-vae
+#   Z-Image Turbo z_image_turbo_fp8_e4m3fn (6.2 GB, slight RAM offload) + Qwen3-4B gguf + flux_vae + Fun ControlNet patches
+#   Anima         existing anima-*-v1.x (4.2 GB) + qwen_3_06b_base + qwen_image_vae from the Anima section (not live-tested in Krita)
+# Shared by all: clip-vision_vit-h, MAT/fooocus inpaint, NMKD/OmniSR/HAT upscalers, EasyNegative.
+#
+# Excluded (would overload ~6 GB usable VRAM and/or need >12 GB system RAM to load):
+#   Flux 1 Krea fp8 (11.9 GB) and Flux Kontext fp8 (11.9 GB), plus T5 3.4 GB: about 15 GB per job, 2.5x the usable VRAM.
+# checkpoint-style lines kept OFF on purpose:
+# diffusion:https://huggingface.co/Comfy-Org/FLUX.1-Krea-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-krea-dev_fp8_scaled.safetensors
+# diffusion:https://huggingface.co/Comfy-Org/flux1-kontext-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors
+#   Flux 2 Klein 4B Q6_K gguf: the plugin's non-CUDA alternative; the fp8 file above is the CUDA pick.
+#   Flux 2 Klein 9B, Qwen Image / Edit (20 GB), Chroma, ERNIE Image, SD 3.5: too large, or no plugin-default download.
+#   Krea 2 (krea2_turbo fp8/int8 13 GB): admin only. The Q4 GGUFs (7.5-8.3 GB + 5.2 GB text encoder) are borderline
+#   and untested in Krita.
+# Already on disk but unusable without a Flux 1 model (about 11.7 GB, kept, nothing deleted): FLUX.1-dev ControlNet
+#   Union/Inpainting, flux1-redux-dev + sigclip_vision_patch14_384, FLUX.1-Turbo-Alpha, t5-v1_1-xxl Q5_K_M gguf.
+# Preprocessor and NSFW-filter weights (about 1.25 GB) download themselves into nodes/ on first use. This list can't target nodes/.
