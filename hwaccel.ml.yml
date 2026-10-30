@@ -12,6 +12,7 @@ name: comfyui-mss-hwaccel
 services:
   cuda:
     image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:nvidia}
+    pull_policy: ${PULL_POLICY:-build}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -33,6 +34,7 @@ services:
 
   rocm:
     image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:rocm}
+    pull_policy: ${PULL_POLICY:-build}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -51,6 +53,7 @@ services:
 
   cpu:
     image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:cpu}
+    pull_policy: ${PULL_POLICY:-build}
     build:
       context: ..
       dockerfile: deploy/Dockerfile

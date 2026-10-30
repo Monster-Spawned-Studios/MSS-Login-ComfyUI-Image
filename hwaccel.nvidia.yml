@@ -11,6 +11,7 @@
 services:
   comfyui-server:
     image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:nvidia}
+    pull_policy: ${PULL_POLICY:-build}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
