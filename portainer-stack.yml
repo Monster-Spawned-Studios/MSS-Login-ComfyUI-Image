@@ -66,6 +66,10 @@ services:
       SECRET_KEY: ${SECRET_KEY:-}
       NTFY_API_KEY: ${NTFY_AUTH_TOKEN:-}
       HOST_BASE_URL: ${HOST_BASE_URL:-http://127.0.0.1:9008}
+      # MSS-Login reads auto_update from this directory's config.json.
+      # It has no environment variable for that block. entrypoint.sh forces
+      # auto_update.enabled=false and mode=off on every start. There is no
+      # stack variable to turn the background check back on.
       MSS_LOGIN_DATA_DIR: ${MSS_DATA_DIR:-/data/mss-login}
       POSTGRES_HOST: ${POST_HOST:-}
       POSTGRES_PORT: ${POST_PORT:-}

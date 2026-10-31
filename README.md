@@ -69,7 +69,7 @@ Leave `COMPOSE_PROFILES` unset to keep the tunnel off.
 
 ## MSS-Login pin
 
-The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. The running code is the image copy, not the host dev checkout.
+The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. The running code is the image copy, not the host dev checkout. Edits to the host `nodes/MSS-Login` directory do not take effect in the container. Every MSS-Login change needs an image rebuild with a new `MSS_LOGIN_REF`.
 
 `portainer-stack.yml` mounts a tmpfs at `/app/ComfyUI/custom_nodes/${MSS_LOGIN_DIR:-MSS-Login}` (`uid=0`, `gid=0`, `mode=0755`, `noexec`, `nosuid`, no size cap). That is the folder ComfyUI loads. The host directory of the same name, including its `.venv` and `__pycache__`, stays on the host and is not read. Startup refuses unless `/proc/self/mountinfo` shows that exact path with fstype `tmpfs` and the directory is empty before the copy. Root then copies the baked tree, sets `root:root` with mode `0755` on directories and `0644` on files, and checks every copied file against `/opt/mss-login/MANIFEST`. The check finishes before `setpriv`. A remount read-only is attempted. If the remount is not permitted, root ownership and those modes are the write barrier: uid 1000 cannot modify the tree.
 
@@ -100,6 +100,14 @@ docker run -e MSS_LOGIN_ALLOW_UNPINNED=true ...
 ```
 
 Do not add that variable to the Portainer stack. Rebuild with a new `MSS_LOGIN_REF` to change what the shadow runs.
+
+## MSS-Login updates
+
+Pinned `1d9acbcee661088145e0adb38ab1dc829393108f` stores this in the data-dir `config.json` key `auto_update` (`utils/updater.py`). There is no environment variable for it. On every start the entrypoint sets `enabled` to false and `mode` to `off`. `update_check_loop` skips the check when `enabled` is false. `run_update_check` returns immediately when `mode` is not `notify` or `auto`, which is before the git pull. Nothing in the stack can turn that back on.
+
+That does not disable the owner **Update now** action. `POST /mss-login/api/update-apply` calls `perform_update` (`utils/updater.py` around line 366, `git pull` plus pip) without reading `auto_update`. The shadow is root-owned and has no `.git` directory, so that action fails. In-place updates are not used. A new MSS-Login build is a new image with a new `MSS_LOGIN_REF`.
+
+`utils/updater.py` line 533 writes `.last_update_check` into the plugin tree and ignores the error. With the background check forced off, that write is not reached. If a check did get there, the failure on the read-only tree is expected.
 
 ## Runtime custom-node dependencies
 

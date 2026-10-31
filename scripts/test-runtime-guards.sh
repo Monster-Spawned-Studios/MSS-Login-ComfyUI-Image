@@ -422,6 +422,39 @@ break_glass_case() {
   echo "break-glass case passed"
 }
 
+auto_update_off_case() {
+  local base cfg
+  base="$(new_case)"
+  cfg="${base}/config.json"
+  printf '%s\n' '{"secret_key_env":"SECRET_KEY","auto_update":{"enabled":true,"mode":"auto","check_url":"https://example.invalid"}}' >"$cfg"
+  MSS_LOGIN_AUTO_UPDATE=auto MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_off >/dev/null
+  python3 - "$cfg" <<'PY'
+import json
+import sys
+
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+if cfg.get("secret_key_env") != "SECRET_KEY":
+    raise SystemExit("unrelated config key was dropped")
+auto = cfg.get("auto_update") or {}
+if auto.get("enabled") is not False or auto.get("mode") != "off":
+    raise SystemExit(f"auto_update was not forced off: {auto}")
+if auto.get("check_url") != "https://example.invalid":
+    raise SystemExit("check_url was dropped")
+PY
+  rm -f "$cfg"
+  MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_off >/dev/null
+  python3 - "$cfg" <<'PY'
+import json
+import sys
+
+auto = json.load(open(sys.argv[1], encoding="utf-8")).get("auto_update") or {}
+if auto.get("enabled") is not False or auto.get("mode") != "off":
+    raise SystemExit(f"missing config was not created off: {auto}")
+PY
+  rm -rf "$base"
+  echo "auto-update off case passed"
+}
+
 filter_case
 cache_case
 shadow_case
@@ -430,4 +463,5 @@ nonempty_tmpfs_case
 duplicate_case
 remote_and_hash_case
 break_glass_case
+auto_update_off_case
 echo "all runtime guard tests passed"

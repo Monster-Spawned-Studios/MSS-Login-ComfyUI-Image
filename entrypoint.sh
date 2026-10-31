@@ -744,6 +744,55 @@ prepare_as_root() {
   prepare_mss_login
 }
 
+# MSS-Login 1d9acbc reads auto_update from DATA_DIR/config.json, not from an
+# environment variable. enabled=false skips update_check_loop. mode "off" is
+# neither "notify" nor "auto", so run_update_check returns before git pull.
+# POST /mss-login/api/update-apply does not read this key. No stack variable
+# can turn it back on; MSS_LOGIN_TEST_MODE does not either.
+force_mss_login_auto_update_off() {
+  local data py
+  data="${MSS_LOGIN_DATA_DIR:-/data/mss-login}"
+  if command -v python3 >/dev/null 2>&1; then
+    py=python3
+  else
+    py=python
+  fi
+  "$py" - "$data" <<'PY'
+import json
+import os
+import sys
+
+data = sys.argv[1]
+path = os.path.join(data, "config.json")
+os.makedirs(data, exist_ok=True)
+cfg = {}
+if os.path.isfile(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            cfg = loaded
+        else:
+            sys.stderr.write(f"[comfyui-deploy] {path} is not a JSON object; leaving it unchanged.\n")
+            sys.exit(1)
+    except json.JSONDecodeError:
+        sys.stderr.write(f"[comfyui-deploy] {path} is not valid JSON; leaving it unchanged.\n")
+        sys.exit(1)
+auto_update = cfg.get("auto_update")
+if not isinstance(auto_update, dict):
+    auto_update = {}
+auto_update["enabled"] = False
+auto_update["mode"] = "off"
+cfg["auto_update"] = auto_update
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(cfg, handle, indent=4)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+  echo "[comfyui-deploy] MSS-Login auto_update in ${data}/config.json is enabled=false, mode=off. Update now is not gated by that key."
+}
+
 warn_if_insightface_models_missing() {
   local dir="/app/ComfyUI/models/insightface"
   if [[ ! -d "$dir" ]]; then
@@ -806,6 +855,7 @@ launch_comfyui() {
   require_writable /app/ComfyUI/user
 
   warn_if_insightface_models_missing
+  force_mss_login_auto_update_off
   prepare_mss_login
 
   detect_line="$(
