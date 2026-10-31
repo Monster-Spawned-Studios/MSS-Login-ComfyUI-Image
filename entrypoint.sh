@@ -841,6 +841,31 @@ install_custom_node_deps() {
   shopt -u nullglob
 }
 
+# Carried over from development 9dc33b1 (user-scripts/01-download-models.sh).
+# Runs the baked, root-owned /usr/local/bin/mss-download-models as uid 1000
+# after the MSS-Login shadow and pin checks. The host user-scripts directory
+# is read for the download list only; no host script is executed, and the
+# downloader writes only under the models directory. Failures are logged and
+# startup continues, as before. Set DOWNLOAD_MODELS=false to skip.
+run_model_downloads() {
+  local list="${MSS_MODELS_LIST:-/home/comfy/user-scripts/models-to-download.txt}"
+  if ! is_truthy "${DOWNLOAD_MODELS:-true}"; then
+    echo "[comfyui-deploy] DOWNLOAD_MODELS is off; skipping model downloads."
+    return 0
+  fi
+  if [[ "$(id -u)" -ne "$COMFY_UID" ]]; then
+    echo "[comfyui-deploy] Refusing model downloads as uid $(id -u); they run only as uid ${COMFY_UID}." >&2
+    return 0
+  fi
+  if [[ -z "${MODELS_TO_DOWNLOAD:-}" && ! -f "$list" ]]; then
+    echo "[comfyui-deploy] No model download list at ${list}; skipping model downloads."
+    return 0
+  fi
+  MODELS_DIR="${MODELS_DIR:-/app/ComfyUI/models}" MSS_MODELS_LIST="$list" \
+    /bin/bash /usr/local/bin/mss-download-models \
+    || echo "[comfyui-deploy] Model downloads finished with exit code $? (continuing startup)." >&2
+}
+
 prepare_as_root() {
   local dest reason
   export HOME=/home/comfy
@@ -1392,6 +1417,7 @@ PY
   fi
 
   install_custom_node_deps
+  run_model_downloads
 
   if [[ "$TARGET_BACKEND" == "cpu" && "$CLI_ARGS" != *"--cpu"* ]]; then
     CLI_ARGS="${CLI_ARGS} --cpu"

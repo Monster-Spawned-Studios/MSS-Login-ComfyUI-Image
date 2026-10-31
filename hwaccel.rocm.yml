@@ -4,6 +4,7 @@
 services:
   comfyui-server:
     image: ghcr.io/monster-spawned-studios/comfyui-mss-login:rocm
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: rocm
     devices:

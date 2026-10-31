@@ -86,6 +86,7 @@ COPY --chmod=755 update.sh /usr/local/bin/update.sh
 COPY --chmod=755 scripts/write-torch-constraints.sh /usr/local/bin/write-torch-constraints.sh
 COPY --chmod=755 scripts/write-mss-login-manifest.sh /usr/local/bin/write-mss-login-manifest.sh
 COPY --chmod=755 scripts/mss-login-healthcheck /usr/local/bin/mss-login-healthcheck
+COPY --chmod=755 scripts/mss-download-models.sh /usr/local/bin/mss-download-models
 COPY patches/mss-login-no-inplace-update.patch /opt/mss-login/patches/mss-login-no-inplace-update.patch
 COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
 
@@ -203,16 +204,26 @@ RUN mkdir -p \
         /usr/local/bin/write-torch-constraints.sh \
         /usr/local/bin/write-mss-login-manifest.sh \
         /usr/local/bin/mss-login-healthcheck \
+        /usr/local/bin/mss-download-models \
     && chmod 755 \
         /usr/local/bin/entrypoint.sh \
         /usr/local/bin/update.sh \
         /usr/local/bin/write-torch-constraints.sh \
         /usr/local/bin/write-mss-login-manifest.sh \
-        /usr/local/bin/mss-login-healthcheck
+        /usr/local/bin/mss-login-healthcheck \
+        /usr/local/bin/mss-download-models
 # Root does not source /home/comfy/.bashrc or /etc/profile.d. No sitecustomize
 # is installed. The venv is uid 1000, including any .pth a later pip install
 # writes; startup python passes --check-hash-based-pycs always and the config
 # writer uses python -S so a venv sitecustomize is not imported as root.
+
+# Hugging Face, Torch, and general caches (development b43a28b). These paths
+# match the stack's cache bind mounts under /home/comfy/.cache. Set after the
+# build steps so no root-owned cache directory is created there.
+ENV HF_HOME=/home/comfy/.cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/home/comfy/.cache/huggingface/hub \
+    TORCH_HOME=/home/comfy/.cache/torch \
+    XDG_CACHE_HOME=/home/comfy/.cache
 
 LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
       org.opencontainers.image.title="comfyui-mss-login" \

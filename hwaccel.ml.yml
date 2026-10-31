@@ -6,6 +6,7 @@ name: comfyui-mss-hwaccel
 services:
   cuda:
     image: ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: cuda
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
@@ -20,6 +21,7 @@ services:
 
   rocm:
     image: ghcr.io/monster-spawned-studios/comfyui-mss-login:rocm
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: rocm
     devices:
@@ -31,6 +33,7 @@ services:
 
   cpu:
     image: ghcr.io/monster-spawned-studios/comfyui-mss-login:cpu
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: cpu
       USE_CPU: "1"

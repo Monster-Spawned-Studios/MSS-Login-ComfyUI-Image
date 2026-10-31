@@ -6,6 +6,7 @@
 services:
   comfyui-server:
     image: ${COMFYUI_IMAGE:-ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia}
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: cuda
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
