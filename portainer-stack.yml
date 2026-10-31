@@ -67,9 +67,8 @@ services:
       NTFY_API_KEY: ${NTFY_AUTH_TOKEN:-}
       HOST_BASE_URL: ${HOST_BASE_URL:-http://127.0.0.1:9008}
       # MSS-Login reads auto_update from this directory's config.json.
-      # It has no environment variable for that block. entrypoint.sh forces
-      # auto_update.enabled=false and mode=off on every start. There is no
-      # stack variable to turn the background check back on.
+      # entrypoint.sh forces enabled=true and mode=notify. There is no stack
+      # variable for that block. In-place Update now is refused by the image patch.
       MSS_LOGIN_DATA_DIR: ${MSS_DATA_DIR:-/data/mss-login}
       POSTGRES_HOST: ${POST_HOST:-}
       POSTGRES_PORT: ${POST_PORT:-}
@@ -92,9 +91,6 @@ services:
       DEVICE_TYPE: ${DEVICE_TYPE:-cuda}
       USE_CPU: ${USE_CPU:-0}
       FORCE_REINSTALL_TORCH: ${FORCE_REINSTALL_TORCH:-0}
-      # Folder name ComfyUI loads under custom_nodes. A tmpfs covers that
-      # path so the host checkout is not imported.
-      MSS_LOGIN_DIR: ${MSS_LOGIN_DIR:-MSS-Login}
       INSTALL_CUSTOM_NODE_DEPS: ${INSTALL_CUSTOM_NODE_DEPS:-true}
     volumes:
       - ${COMFYUI_USER_SCRIPTS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/user-scripts}:/home/comfy/user-scripts:rw
@@ -121,11 +117,11 @@ services:
     # root-owned. noexec is acceptable. The entrypoint refuses to start
     # unless mountinfo shows this path as tmpfs and empty before seeding.
     tmpfs:
-      - /app/ComfyUI/custom_nodes/${MSS_LOGIN_DIR:-MSS-Login}:uid=0,gid=0,mode=0755,noexec,nosuid
+      - /app/ComfyUI/custom_nodes/MSS-Login:uid=0,gid=0,mode=0755,noexec,nosuid
     labels:
       - "com.centurylinklabs.watchtower.enable=${AUTO_UPDATE:-false}"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:${COMFYUI_PORT:-9008}/mss-login/login"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:${COMFYUI_PORT:-9008}/login"]
       interval: 30s
       timeout: 10s
       retries: 3

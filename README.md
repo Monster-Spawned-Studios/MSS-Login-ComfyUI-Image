@@ -11,10 +11,10 @@ Workflow: `.github/workflows/publish-ghcr.yml`.
 - Trigger: `workflow_dispatch` only. No push, tag, or schedule.
 - Auth: the workflow `GITHUB_TOKEN` with `packages: write`. No other secrets.
 - Target: Dockerfile stage `nvidia` (default CUDA channel `cu130`).
-- Every run pushes `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<commit>`.
-- `push_nvidia_tag` also pushes `:nvidia`. Its default is **off**. Portainer re-pulls `:nvidia`, so leave this off until the image is ready to deploy.
-- `:latest` is refused.
-- ComfyUI-MSS-Login is fetched over HTTPS at build time. The single pin is `MSS_LOGIN_REF`, default `1d9acbcee661088145e0adb38ab1dc829393108f` (development). The repo URL cannot contain credentials. A direct sha fetch is tried first; if that fails, the build fetches `development` and checks out that exact sha.
+- Every run pushes `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<12 character commit>`.
+- Input `push_nvidia_tag` (boolean, default **off**) also pushes `:nvidia`. Portainer re-pulls `:nvidia`, so leave this off until the image is ready to deploy.
+- `:latest` is refused. Optional input `tag` adds one extra tag and cannot be `latest`.
+- There is no workflow input for the MSS-Login pin. `MSS_LOGIN_REF` is the `ARG` default in the Dockerfile. A direct sha fetch is tried first; if that fails, the build fetches `development` and checks out that exact sha.
 
 Build args:
 
@@ -35,7 +35,8 @@ docker build --target nvidia \
 ## What the image contains
 
 - ComfyUI under `/app/ComfyUI`, Python 3.13 via uv, user `comfy` (uid/gid 1000).
-- ComfyUI-MSS-Login at `/opt/mss-login/ComfyUI-MSS-Login`, owned by root, with `/opt/mss-login/MANIFEST` (sha256 of every file that is copied onto the shadow). `.git`, `__pycache__`, `.pyc`, and `.pyo` are not in that manifest.
+- ComfyUI-MSS-Login at `/opt/mss-login/ComfyUI-MSS-Login`, owned by root. `/opt/mss-login/MANIFEST` is the sha256 of regular files. `MANIFEST.entries` lists every non-directory (including symlinks and fifos). `MANIFEST.dirs` lists directories. `.git`, `__pycache__`, `.pyc`, and `.pyo` are omitted. `/opt/mss-login/PATCHES` names `mss-login-no-inplace-update.patch`.
+- `entrypoint.sh`, `update.sh`, `write-torch-constraints.sh`, and `write-mss-login-manifest.sh` are root:root mode `0755` in `/usr/local/bin`. The venv stays uid 1000. There is no `sitecustomize.py`. Root does not source `/home/comfy/.bashrc` or `/etc/profile.d`.
 - `curl`, used by the healthcheck.
 - NVIDIA stage: PyTorch CUDA wheels and `LD_LIBRARY_PATH` pointed at the venv cuDNN/CUDA libraries (`/app/ComfyUI/.venv/lib/python3.13/site-packages/...`). This replaces `user-scripts/00-setup-uv-venv.sh`, which targeted `/root/ComfyUI/.venv`. The script is still mounted and is not executed.
 - The host `custom_nodes/MSS-Login` checkout is not loaded. A tmpfs is mounted on that folder. Root copies the baked tree onto it, locks it `root:root` (`0755` directories, `0644` files), checks the manifest, and only then drops to uid 1000.
@@ -71,9 +72,11 @@ Leave `COMPOSE_PROFILES` unset to keep the tunnel off.
 
 The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. The running code is the image copy, not the host dev checkout. Edits to the host `nodes/MSS-Login` directory do not take effect in the container. Every MSS-Login change needs an image rebuild with a new `MSS_LOGIN_REF`.
 
-`portainer-stack.yml` mounts a tmpfs at `/app/ComfyUI/custom_nodes/${MSS_LOGIN_DIR:-MSS-Login}` (`uid=0`, `gid=0`, `mode=0755`, `noexec`, `nosuid`, no size cap). That is the folder ComfyUI loads. The host directory of the same name, including its `.venv` and `__pycache__`, stays on the host and is not read. Startup refuses unless `/proc/self/mountinfo` shows that exact path with fstype `tmpfs` and the directory is empty before the copy. Root then copies the baked tree, sets `root:root` with mode `0755` on directories and `0644` on files, and checks every copied file against `/opt/mss-login/MANIFEST`. The check finishes before `setpriv`. A remount read-only is attempted. If the remount is not permitted, root ownership and those modes are the write barrier: uid 1000 cannot modify the tree.
+`portainer-stack.yml` mounts a tmpfs at `/app/ComfyUI/custom_nodes/MSS-Login` (`uid=0`, `gid=0`, `mode=0755`, `noexec`, `nosuid`, no size cap). That folder name is fixed. `MSS_LOGIN_DIR` is not a stack variable; only `MSS_LOGIN_TEST_MODE=1` may point tests at another name. The host directory of the same name, including its `.venv` and `__pycache__`, stays on the host and is not read. Startup refuses unless `/proc/self/mountinfo` shows that exact path as fstype `tmpfs` and the directory is empty before the copy. Root then copies the baked tree, sets `root:root` with mode `0755` on directories and `0644` on files, and checks the shadow against the baked file hashes, the non-directory list, and the directory list. The check finishes before `setpriv`. A remount read-only is attempted. If the remount is not permitted, root ownership and those modes are the write barrier: uid 1000 cannot modify the tree.
 
-Python bytecode is written only under `PYTHONPYCACHEPREFIX=/tmp/comfy-pycache`. The image sets that variable, the entrypoint forces it again before any `python` or `uv` command, and `sitecustomize.py` sets `sys.pycache_prefix` to the same directory. The host `__pycache__` is under the covered mount, so it is not on the import path.
+Startup refuses `EXTRA_CLI_ARGS` (or any other `CLI_ARGS` token) that changes node loading or a base path. From `comfy/cli_args.py` at `0dbfd493b4cc604db743c699f0f7ce01348e54a4`, the refused flags are `--disable-all-custom-nodes`, `--whitelist-custom-nodes`, `--enable-manager`, `--enable-manager-legacy-ui`, `--disabled-nodes-config`, `--disable-partner-nodes`, `--disable-api-nodes`, `--offline`, `--base-directory`, `--extra-model-paths-config`, `--output-directory`, `--temp-directory`, `--input-directory`, `--previews-directory`, `--user-directory`, and `--models-directory`. `extra_model_paths.yaml` is parsed with PyYAML and refused when it contains a `custom_nodes` key or cannot be parsed. After ComfyUI starts, the entrypoint requires `GET /login` to return 200, 301, or 302 within 300 seconds and stops the process if it does not.
+
+Python bytecode is written only under `PYTHONPYCACHEPREFIX=/tmp/comfy-pycache`. On startup, root deletes that directory and recreates it mode `0700` owned by uid 1000. Every `python` launch from the entrypoint and `update.sh` passes `--check-hash-based-pycs always`. The host `__pycache__` is under the covered mount, so it is not on the import path. Git metadata inside other custom nodes is read as uid 1000 with `safe.directory` set to that directory only.
 
 ### Duplicate custom nodes
 
@@ -103,11 +106,20 @@ Do not add that variable to the Portainer stack. Rebuild with a new `MSS_LOGIN_R
 
 ## MSS-Login updates
 
-Pinned `1d9acbcee661088145e0adb38ab1dc829393108f` stores this in the data-dir `config.json` key `auto_update` (`utils/updater.py`). There is no environment variable for it. On every start the entrypoint sets `enabled` to false and `mode` to `off`. `update_check_loop` skips the check when `enabled` is false. `run_update_check` returns immediately when `mode` is not `notify` or `auto`, which is before the git pull. Nothing in the stack can turn that back on.
+Pinned `1d9acbcee661088145e0adb38ab1dc829393108f` stores update behavior in the data-dir `config.json` key `auto_update` (`utils/updater.py`). There is no environment variable for it. On every start the entrypoint sets `enabled` to true and `mode` to `notify`, so a newer release is still reported. `mode` is not `auto`, so the background check does not `git pull`.
 
-That does not disable the owner **Update now** action. `POST /mss-login/api/update-apply` calls `perform_update` (`utils/updater.py` around line 366, `git pull` plus pip) without reading `auto_update`. The shadow is root-owned and has no `.git` directory, so that action fails. In-place updates are not used. A new MSS-Login build is a new image with a new `MSS_LOGIN_REF`.
+`POST /mss-login/api/update-apply` ignores `auto_update` and would otherwise call `perform_update` (git pull plus pip). The image applies `patches/mss-login-no-inplace-update.patch` with `git apply --check` and then `git apply` before it writes the manifest. The build fails if that patch does not apply. `/opt/mss-login/PATCHES` records the patch name, and `/opt/mss-login/REVISION` stays the pinned commit. The patched route returns HTTP 403 and `Updates are applied by rebuilding the image with a new MSS_LOGIN_REF`. `perform_update` and `perform_recovery_update` return that same error and do not run git or pip. The Update now button is created in JavaScript (`web/js/auth.js` and `web/js/loading.js`), not a one-line template, so the button can still appear in notify mode. The API refuses it.
 
-`utils/updater.py` line 533 writes `.last_update_check` into the plugin tree and ignores the error. With the background check forced off, that write is not reached. If a check did get there, the failure on the read-only tree is expected.
+`utils/updater.py` line 533 writes `.last_update_check` into the plugin tree and ignores the error. In notify mode that write can be reached. Failure on the read-only shadow is expected.
+
+## Updating MSS-Login
+
+1. Push the MSS-Login commits to `https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git`.
+2. Open a pull request in this repository that changes the `ARG MSS_LOGIN_REF` default in the `Dockerfile` to that full commit sha. That `ARG` is the only pin. `.github/workflows/publish-ghcr.yml` does not take an `mss_login_ref` input and does not pass `MSS_LOGIN_REF` as a build-arg, so a dispatch cannot select a different commit. If `patches/mss-login-no-inplace-update.patch` no longer applies, update that file in the same pull request. Security reviews the pin and the patch.
+3. Merge the pull request to `production`.
+4. Manually run the `Publish NVIDIA image` workflow (`.github/workflows/publish-ghcr.yml`, `workflow_dispatch`). Set the input `push_nvidia_tag` to true to publish `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia`. Every run also pushes the immutable tag `sha-<first 12 characters of GITHUB_SHA>`. Leave `tag` blank unless an extra tag is required. Do not use `latest`.
+5. Redeploy stack 256 in Portainer. The stack image is `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia` (`COMFYUI_IMAGE`). Portainer's scheduled re-pull of that tag (about 24 hours, with force-pull) picks it up, or pull the image and redeploy the stack by hand. Watchtower stays off (`AUTO_UPDATE` default `false`). Confirm `/opt/mss-login/REVISION` is the new sha and that the log contains `MSS-Login shadow` and `mode=notify`. `GET /login` must return 200, 301, or 302.
+6. Rollback by setting `COMFYUI_IMAGE` to the previous `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<12>` tag and redeploying the stack. Do not retag `:nvidia` backward unless that image is the one that should stay current.
 
 ## Runtime custom-node dependencies
 
@@ -125,7 +137,7 @@ InstantID and PuLID load faces from ComfyUI's `models/insightface`, not from `IN
 
 The default host path is `/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface`. That directory already holds verified `antelopev2` and `buffalo_l` and must exist before deploy. Compose is set to `create_host_path: false`, so Docker will not create an empty root-owned directory if the path is missing. The entrypoint logs a warning when the mount is missing or empty. The image does not download these packs.
 
-`extra_model_paths.yaml` and `.bashrc` must already be files on the host. Docker creates a directory if a file bind is missing. `extra_model_paths.yaml` is mounted read-only, so the entrypoint cannot change its owner. If it is mode `600` and owned by root, make it readable by uid 1000 on the host (`chmod a+r`).
+`extra_model_paths.yaml` and `.bashrc` must already be files on the host. Docker creates a directory if a file bind is missing, and the entrypoint then refuses to start. `extra_model_paths.yaml` is mounted read-only. A `custom_nodes` key in it is refused. If the file is mode `600` and owned by root, make it readable by uid 1000 on the host (`chmod a+r`). The entrypoint does not source `.bashrc`.
 
 `input` and `user` are new host binds. Stack 250 kept those inside the `comfyui-laptop-data` volume (`/root/ComfyUI/input` and `/root/ComfyUI/user`). Copy them to `/mnt/tmd-secure/Data/Docker/ComfyUI/input` and `.../user` if they should follow this stack. Models, nodes, output, and mss-data stay on the same host directories as stack 250.
 
@@ -160,7 +172,6 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `DEVICE_TYPE` | `cuda` | `DEVICE_TYPE` |
 | `USE_CPU` | `0` | `USE_CPU` |
 | `FORCE_REINSTALL_TORCH` | `0` | `FORCE_REINSTALL_TORCH` |
-| `MSS_LOGIN_DIR` | `MSS-Login` | folder ComfyUI loads; tmpfs target under `custom_nodes` |
 | `INSTALL_CUSTOM_NODE_DEPS` | `true` | `INSTALL_CUSTOM_NODE_DEPS` |
 | `COMFYUI_INSIGHTFACE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface` | existing host directory, mounted read-only at `/app/ComfyUI/models/insightface` |
 | `CORS` | `*` | inside `CLI_ARGS` |
@@ -218,4 +229,4 @@ Set in the container and not read from the stack environment:
 
 ## Updates inside a running container
 
-`docker exec -u 1000 comfyui-server /app/update.sh` updates ComfyUI and PyTorch. It does not replace the MSS-Login checkout. Change that pin by publishing a new image.
+`docker exec -u 1000 comfyui-server /usr/local/bin/update.sh` updates ComfyUI and PyTorch. It does not replace MSS-Login. Change that pin with the steps in [Updating MSS-Login](#updating-mss-login).

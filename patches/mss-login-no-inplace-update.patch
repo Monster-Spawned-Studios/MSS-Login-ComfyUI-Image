@@ -1,0 +1,194 @@
+diff --git a/routes/admin.py b/routes/admin.py
+index 32e45bd..80323d7 100644
+--- a/routes/admin.py
++++ b/routes/admin.py
+@@ -1310,33 +1310,12 @@ routes.get("/api/mss-login/api/update-notice")(api_get_update_notice)
+ 
+ @routes.post("/mss-login/api/update-apply")
+ async def api_update_apply(request):
+-	"""Apply MSS-Login self-update. Requires can_update_mss_login."""
+-	try:
+-		role, perms, username = access_control._get_user_role_and_permissions(request)
+-	except Exception:
+-		role, perms, username = "guest", {}, None
+-	if not username:
+-		return web.json_response({"error": "Authentication required"}, status=401)
+-	if not user_can_update_mss_login(role, perms):
+-		return web.json_response(
+-			{"error": "Update permission required (can_update_mss_login)"}, status=403
+-		)
+-	try:
+-		repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+-		loop = asyncio.get_event_loop()
+-		success, msg = await loop.run_in_executor(
+-			None, lambda: perform_update(repo_root, get_data_dir(), logger)
+-		)
+-		return web.json_response(
+-			{
+-				"success": bool(success),
+-				"message": msg
+-				or ("Update applied. Restart ComfyUI to finish." if success else "Update failed."),
+-			},
+-			status=200 if success else 500,
+-		)
+-	except Exception as e:
+-		return web.json_response({"error": str(e)}, status=500)
++	"""In-place updates are disabled. Rebuild the image with a new MSS_LOGIN_REF."""
++	del request
++	return web.json_response(
++		{"error": "Updates are applied by rebuilding the image with a new MSS_LOGIN_REF"},
++		status=403,
++	)
+ 
+ 
+ routes.post("/api/mss-login/api/update-apply")(api_update_apply)
+diff --git a/utils/updater.py b/utils/updater.py
+index 39d907e..408f727 100644
+--- a/utils/updater.py
++++ b/utils/updater.py
+@@ -362,139 +362,17 @@ def backup_before_update(data_dir: str) -> str | None:
+ 
+ 
+ def perform_update(repo_root: str, data_dir: str, logger: Any) -> tuple[bool, str]:
+-	"""
+-	Run git pull and pip install. Backup data dir first. On failure, attempt rollback.
+-	Returns (success, message).
+-	"""
+-	backup_path = backup_before_update(data_dir)
+-	if not backup_path and os.path.isdir(os.path.join(data_dir, "data")):
+-		logger.warning("[mss-login] Update backup skipped (backup dir creation failed).")
+-	try:
+-		# Stash local changes if any
+-		try:
+-			subprocess.run(
+-				["git", "stash", "push", "-m", "mss_login_auto_update"],
+-				cwd=repo_root,
+-				capture_output=True,
+-				timeout=30,
+-				check=False,
+-			)
+-		except Exception:
+-			pass
+-		# Pull
+-		r = subprocess.run(
+-			["git", "pull", "origin", "--no-edit"],
+-			cwd=repo_root,
+-			capture_output=True,
+-			timeout=60,
+-			text=True,
+-		)
+-		if r.returncode != 0:
+-			# Rollback
+-			try:
+-				subprocess.run(
+-					["git", "merge", "--abort"], cwd=repo_root, capture_output=True, timeout=10
+-				)
+-			except Exception:
+-				pass
+-			try:
+-				subprocess.run(
+-					["git", "reset", "--hard", "HEAD@{1}"],
+-					cwd=repo_root,
+-					capture_output=True,
+-					timeout=10,
+-				)
+-			except Exception:
+-				pass
+-			return False, r.stderr or r.stdout or "git pull failed"
+-		# Optional: pip install -r requirements.txt
+-		req = os.path.join(repo_root, "requirements.txt")
+-		if os.path.isfile(req):
+-			try:
+-				subprocess.run(
+-					[sys.executable, "-m", "pip", "install", "-r", req, "-q"],
+-					cwd=repo_root,
+-					capture_output=True,
+-					timeout=120,
+-					check=False,
+-				)
+-				if DEBUG_MODE:
+-					print("[mss-login] Auto-update: installed dependencies from requirements.txt")
+-				subprocess.run(
+-					[sys.executable, "-m", "uv", "sync", "--group", "production"],
+-					cwd=repo_root,
+-					capture_output=True,
+-					timeout=600,
+-					check=False,
+-				)
+-				if DEBUG_MODE:
+-					print("[mss-login] Auto-update: installed dependencies from pyproject.toml")
+-			except Exception:
+-				print(
+-					f"[mss-login] Auto-update: failed to install dependencies from dependency files. Error:\n{sys.exc_info()[1]}"
+-				)
+-				return (
+-					False,
+-					"Failed to install dependencies from dependency files. Please check the logs for more information.",
+-				)
+-		return True, "Update applied. Restart ComfyUI to use the new version."
+-	except subprocess.TimeoutExpired:
+-		return False, "Update timed out."
+-	except Exception as e:
+-		return False, str(e)
++	"""In-place git and pip updates are disabled. Rebuild the image instead."""
++	del repo_root, data_dir, logger
++	return False, "Updates are applied by rebuilding the image with a new MSS_LOGIN_REF."
+ 
+ 
+ def perform_recovery_update(
+ 	repo_root: str, data_dir: str, logger: Any, branch: str = "development"
+ ) -> tuple[bool, str]:
+-	"""Last-resort recovery update for repeated experimental failures.
+-
+-	Security invariant: never delete or rewrite external data-dir credentials/users DB.
+-	This routine only manipulates git-tracked files under repo_root.
+-	"""
+-	if not os.path.isdir(repo_root):
+-		return False, "Repository path is missing."
+-	if not os.path.isdir(data_dir):
+-		logger.warning(
+-			"[mss-login] Recovery update: data dir missing, continuing without data backup."
+-		)
+-	backup_path = backup_before_update(data_dir) if os.path.isdir(data_dir) else None
+-	if os.path.isdir(data_dir) and not backup_path:
+-		logger.warning(
+-			"[mss-login] Recovery update: data backup failed; aborting to protect credentials."
+-		)
+-		return False, "Recovery aborted because data backup failed."
+-	try:
+-		fetch = subprocess.run(
+-			["git", "fetch", "origin", branch],
+-			cwd=repo_root,
+-			capture_output=True,
+-			timeout=60,
+-			text=True,
+-			check=False,
+-		)
+-		if fetch.returncode != 0:
+-			return False, fetch.stderr or fetch.stdout or "git fetch failed"
+-
+-		hard_reset = subprocess.run(
+-			["git", "reset", "--hard", f"origin/{branch}"],
+-			cwd=repo_root,
+-			capture_output=True,
+-			timeout=30,
+-			text=True,
+-			check=False,
+-		)
+-		if hard_reset.returncode != 0:
+-			return False, hard_reset.stderr or hard_reset.stdout or "git reset failed"
+-
+-		success, msg = perform_update(repo_root, data_dir, logger)
+-		if success:
+-			return True, "Recovery update succeeded. Credentials/user data were preserved."
+-		return False, f"Recovery update post-reset failed: {msg}"
+-	except subprocess.TimeoutExpired:
+-		return False, "Recovery update timed out."
+-	except Exception as exc:
+-		return False, str(exc)
++	"""In-place recovery updates are disabled. Rebuild the image instead."""
++	del repo_root, data_dir, logger, branch
++	return False, "Updates are applied by rebuilding the image with a new MSS_LOGIN_REF."
+ 
+ 
+ async def run_update_check(app: Any, logger: Any, config: dict[str, Any]) -> None:

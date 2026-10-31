@@ -327,16 +327,16 @@ duplicate_case() {
   grep -q 'ComfyUI-MSS-Login' <<<"$log" || fail "did not list the renamed folder"
   grep -q 'also_login.py' <<<"$log" || fail "did not list the .py file"
   grep -q '.hidden-node' <<<"$log" || fail "hidden directory was skipped"
-  if grep -q 'SkipMe.disabled' <<<"$log"; then
+  if grep -F -q 'SkipMe.disabled' <<<"$log"; then
     fail "loader-skipped .disabled was treated as a duplicate"
   fi
-  if grep -q '__pycache__' <<<"$log"; then
+  if grep -F -q '__pycache__' <<<"$log"; then
     fail "loader-skipped __pycache__ was treated as a duplicate"
   fi
-  if grep -q 'evil.pyc' <<<"$log"; then
+  if grep -F -q 'evil.pyc' <<<"$log"; then
     fail "non-.py file was treated as a duplicate"
   fi
-  if grep -q 'Pack/MSS-Login' <<<"$log"; then
+  if grep -F -q 'Pack/MSS-Login' <<<"$log"; then
     fail "nested package was treated as a top-level import"
   fi
   [[ ! -f "${dest}/pyproject.toml" ]] || fail "duplicate still seeded the shadow"
@@ -426,8 +426,8 @@ auto_update_off_case() {
   local base cfg
   base="$(new_case)"
   cfg="${base}/config.json"
-  printf '%s\n' '{"secret_key_env":"SECRET_KEY","auto_update":{"enabled":true,"mode":"auto","check_url":"https://example.invalid"}}' >"$cfg"
-  MSS_LOGIN_AUTO_UPDATE=auto MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_off >/dev/null
+  printf '%s\n' '{"secret_key_env":"SECRET_KEY","auto_update":{"enabled":false,"mode":"auto","check_url":"https://example.invalid"}}' >"$cfg"
+  MSS_LOGIN_AUTO_UPDATE=off MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_notify >/dev/null
   python3 - "$cfg" <<'PY'
 import json
 import sys
@@ -436,23 +436,129 @@ cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 if cfg.get("secret_key_env") != "SECRET_KEY":
     raise SystemExit("unrelated config key was dropped")
 auto = cfg.get("auto_update") or {}
-if auto.get("enabled") is not False or auto.get("mode") != "off":
-    raise SystemExit(f"auto_update was not forced off: {auto}")
+if auto.get("enabled") is not True or auto.get("mode") != "notify":
+    raise SystemExit(f"auto_update was not forced to notify: {auto}")
 if auto.get("check_url") != "https://example.invalid":
     raise SystemExit("check_url was dropped")
 PY
   rm -f "$cfg"
-  MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_off >/dev/null
+  MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_notify >/dev/null
   python3 - "$cfg" <<'PY'
 import json
 import sys
 
 auto = json.load(open(sys.argv[1], encoding="utf-8")).get("auto_update") or {}
-if auto.get("enabled") is not False or auto.get("mode") != "off":
-    raise SystemExit(f"missing config was not created off: {auto}")
+if auto.get("enabled") is not True or auto.get("mode") != "notify":
+    raise SystemExit(f"missing config was not created notify: {auto}")
 PY
   rm -rf "$base"
-  echo "auto-update off case passed"
+  echo "auto-update notify case passed"
+}
+
+# shellcheck disable=SC2030,SC2031
+security_regressions() {
+  local base seed nodes dest yaml log status
+  if grep -n 'chmod 1777' "${root}/entrypoint.sh" >/dev/null; then
+    fail "pycache must not be mode 1777"
+  fi
+  mss_login_route_ok 200 || fail "200 should pass the login route check"
+  mss_login_route_ok 302 || fail "302 should pass the login route check"
+  if mss_login_route_ok 500; then
+    fail "500 must not pass the login route check"
+  fi
+  (
+    export MSS_LOGIN_TEST_MODE=0
+    export MSS_LOGIN_DIR=Other
+    export NODES_DIR=/tmp/nodes-fixed
+    got="$(mss_login_shadow_dest)"
+    [[ "$got" == "/tmp/nodes-fixed/MSS-Login" ]] || exit 1
+  ) || fail "MSS_LOGIN_DIR was honored outside test mode"
+  log="$(mktemp)"
+  set +e
+  (
+    export CLI_ARGS="--listen 0.0.0.0 --base-directory /tmp/evil"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "base-directory was allowed"
+  grep -q -- '--base-directory' "$log" || fail "refusal did not name the flag: $(cat "$log")"
+  set +e
+  (
+    export CLI_ARGS="--listen 0.0.0.0 --whitelist-custom-nodes MSS-Login"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "whitelist-custom-nodes was allowed"
+  yaml="$(mktemp)"
+  printf '%s\n' 'comfyui:' '  checkpoints: models/checkpoints' >"$yaml"
+  MSS_EXTRA_MODEL_PATHS="$yaml" refuse_extra_model_paths_custom_nodes
+  printf '%s\n' 'comfyui:' '  custom_nodes: /tmp/other-nodes' >>"$yaml"
+  set +e
+  (
+    export MSS_EXTRA_MODEL_PATHS="$yaml"
+    refuse_extra_model_paths_custom_nodes
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "custom_nodes key was allowed"
+  printf '%s\n' 'not: [valid: yaml' >"$yaml"
+  set +e
+  (
+    export MSS_EXTRA_MODEL_PATHS="$yaml"
+    refuse_extra_model_paths_custom_nodes
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "unparseable extra_model_paths was allowed"
+  base="$(new_case)"
+  seed="${base}/seed"
+  nodes="${base}/custom_nodes"
+  dest="${nodes}/MSS-Login"
+  make_plugin "$seed"
+  mkdir -p "${seed}/utils"
+  ln -s pyproject.toml "${seed}/utils/link.toml"
+  mkfifo "${seed}/utils/pipe"
+  arm_tmpfs "$dest"
+  MSS_LOGIN_SEED="$seed" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login >/dev/null
+  [[ -L "${dest}/utils/link.toml" ]] || fail "symlink was not copied onto the shadow"
+  [[ -p "${dest}/utils/pipe" ]] || fail "fifo was not copied onto the shadow"
+  mkfifo "${dest}/extra.pipe"
+  set +e
+  (
+    export MSS_LOGIN_SEED="$seed"
+    export NODES_DIR="$nodes"
+    export MSS_LOGIN_DIR="MSS-Login"
+    prepare_mss_login
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "extra fifo was accepted: $(cat "$log")"
+  grep -q 'non-directory list' "$log" || fail "extra fifo message missing: $(cat "$log")"
+  d="$(mktemp -d)"
+  (
+    unset PYTHONPYCACHEPREFIX
+    python3 - "$d" <<'PY'
+import py_compile
+import sys
+from pathlib import Path
+src = Path(sys.argv[1]) / "hashmod.py"
+src.write_text("VALUE = 1\n", encoding="utf-8")
+py_compile.compile(str(src), invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH, doraise=True)
+src.write_text("VALUE = 2\n", encoding="utf-8")
+PY
+    python3 -c "import sys; sys.path.insert(0, '${d}'); import hashmod; print(hashmod.VALUE)" >"$log"
+    got="$(tr -d '[:space:]' <"$log")"
+    [[ "$got" == "1" ]] || exit 2
+    comfy_python -c "import sys; sys.path.insert(0, '${d}'); import hashmod; print(hashmod.VALUE)" >"$log"
+    got="$(tr -d '[:space:]' <"$log")"
+    [[ "$got" == "2" ]] || exit 3
+  ) || fail "hash-based pyc check did not prefer the source (see ${log})"
+  rm -rf "$base" "$d"
+  rm -f "$log" "$yaml"
+  unset MSS_MOUNTINFO MSS_EXTRA_MODEL_PATHS
+  echo "security regressions passed"
 }
 
 filter_case
@@ -464,4 +570,5 @@ duplicate_case
 remote_and_hash_case
 break_glass_case
 auto_update_off_case
+security_regressions
 echo "all runtime guard tests passed"

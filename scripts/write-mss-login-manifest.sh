@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Write a sha256 manifest of the baked MSS-Login tree.
-# Excludes .git, __pycache__, and bytecode. Those paths are not copied onto
-# the runtime shadow and are not part of the verified file list.
+# Write the baked MSS-Login lists.
+# MANIFEST is sha256 of regular files. MANIFEST.entries is every non-directory
+# (files, symlinks, fifos). MANIFEST.dirs is every directory except the root.
+# .git, __pycache__, and bytecode names are omitted from all three.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -18,6 +19,8 @@ if [[ ! -d "$src" ]]; then
 fi
 
 tmp="$(mktemp)"
+entries="$(mktemp)"
+dirs="$(mktemp)"
 (
   cd "$src"
   find . \
@@ -31,4 +34,23 @@ tmp="$(mktemp)"
         printf '%s  %s\n' "$sum" "$rel"
       done
 ) >"$tmp"
+(
+  cd "$src"
+  find . \
+    \( -path './.git' -o -path '*/__pycache__' \) -prune -o \
+    ! -type d ! -name '*.pyc' ! -name '*.pyo' -print \
+    | sed 's|^\./||' \
+    | sort
+) >"$entries"
+(
+  cd "$src"
+  find . \
+    \( -path './.git' -o -path '*/__pycache__' \) -prune -o \
+    -type d -print \
+    | sed 's|^\./||' \
+    | sed '/^$/d' \
+    | sort
+) >"$dirs"
 mv "$tmp" "$out"
+mv "$entries" "${out}.entries"
+mv "$dirs" "${out}.dirs"

@@ -79,10 +79,13 @@ RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
     && uv pip install --python /app/ComfyUI/.venv/bin/python -r /opt/mss-login/ComfyUI-MSS-Login/requirements.txt \
     && rm -rf /tmp/uv-cache
 
-COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
-COPY --chmod=755 update.sh /app/update.sh
-COPY --chmod=755 scripts/write-torch-constraints.sh /app/write-torch-constraints.sh
-COPY --chmod=755 scripts/write-mss-login-manifest.sh /app/scripts/write-mss-login-manifest.sh
+# These stay root:root under /usr/local/bin. The later chown of /app must not
+# cover them: uid 1000 can write the venv, and root executes this entrypoint.
+COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=755 update.sh /usr/local/bin/update.sh
+COPY --chmod=755 scripts/write-torch-constraints.sh /usr/local/bin/write-torch-constraints.sh
+COPY --chmod=755 scripts/write-mss-login-manifest.sh /usr/local/bin/write-mss-login-manifest.sh
+COPY patches/mss-login-no-inplace-update.patch /opt/mss-login/patches/mss-login-no-inplace-update.patch
 COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
 
 # facebookresearch/sam2 main at the time of this pin. The wheel is built in
@@ -108,12 +111,14 @@ RUN mkdir -p \
         /home/comfy/user-scripts \
         /opt/comfy-constraints \
         /tmp/comfy-pycache \
-    && chmod 1777 /tmp/comfy-pycache \
-    && /app/write-torch-constraints.sh \
+    && chown 1000:1000 /tmp/comfy-pycache \
+    && chmod 0700 /tmp/comfy-pycache \
+    && /usr/local/bin/write-torch-constraints.sh \
     && cp /opt/mss-login/REVISION /app/ComfyUI/.venv/.mss-build-id \
-    && /app/scripts/write-mss-login-manifest.sh /opt/mss-login/ComfyUI-MSS-Login /opt/mss-login/MANIFEST \
-    && sp="$(/app/ComfyUI/.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
-    && printf '%s\n' 'import sys' 'sys.pycache_prefix = "/tmp/comfy-pycache"' > "${sp}/sitecustomize.py" \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply --check /opt/mss-login/patches/mss-login-no-inplace-update.patch \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply /opt/mss-login/patches/mss-login-no-inplace-update.patch \
+    && printf '%s\n' "mss-login-no-inplace-update.patch" > /opt/mss-login/PATCHES \
+    && /usr/local/bin/write-mss-login-manifest.sh /opt/mss-login/ComfyUI-MSS-Login /opt/mss-login/MANIFEST \
     && if [[ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2.git" && "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2" ]]; then \
          echo "SAM2_REPO must be https://github.com/facebookresearch/sam2.git" >&2; \
          exit 1; \
@@ -156,7 +161,21 @@ RUN mkdir -p \
     && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/uv-python /opt/uv-tools /opt/comfy-constraints \
     && chown -R root:root /opt/mss-login /opt/sam2 \
     && find /opt/mss-login /opt/sam2 -type d -exec chmod 0755 {} + \
-    && find /opt/mss-login /opt/sam2 -type f -exec chmod 0644 {} +
+    && find /opt/mss-login /opt/sam2 -type f -exec chmod 0644 {} + \
+    && chown root:root \
+        /usr/local/bin/entrypoint.sh \
+        /usr/local/bin/update.sh \
+        /usr/local/bin/write-torch-constraints.sh \
+        /usr/local/bin/write-mss-login-manifest.sh \
+    && chmod 755 \
+        /usr/local/bin/entrypoint.sh \
+        /usr/local/bin/update.sh \
+        /usr/local/bin/write-torch-constraints.sh \
+        /usr/local/bin/write-mss-login-manifest.sh
+# Root does not source /home/comfy/.bashrc or /etc/profile.d. No sitecustomize
+# is installed. The venv is uid 1000, including any .pth a later pip install
+# writes; startup python passes --check-hash-based-pycs always and the config
+# writer uses python -S so a venv sitecustomize is not imported as root.
 
 LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
       org.opencontainers.image.title="comfyui-mss-login" \
@@ -168,9 +187,9 @@ WORKDIR /app/ComfyUI
 EXPOSE 9008
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=300s \
-    CMD ["curl", "-f", "http://127.0.0.1:9008/mss-login/login"]
+    CMD ["curl", "-f", "http://127.0.0.1:9008/login"]
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 FROM base AS cpu
 ENV DEVICE_TYPE=cpu \
@@ -180,7 +199,7 @@ RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --index-url https://download.pytorch.org/whl/cpu \
         torch torchvision torchaudio \
     && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend \
-    && /app/write-torch-constraints.sh \
+    && /usr/local/bin/write-torch-constraints.sh \
     && rm -rf /tmp/uv-cache
 
 FROM base AS nvidia
@@ -210,7 +229,7 @@ RUN case "${CUDA_VERSION}" in \
         --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" \
         torch torchvision torchaudio \
     && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend \
-    && /app/write-torch-constraints.sh \
+    && /usr/local/bin/write-torch-constraints.sh \
     && uv pip install --python /app/ComfyUI/.venv/bin/python \
         --constraint /opt/comfy-constraints/torch.txt \
         --only-binary torch,torchvision,torchaudio,onnxruntime-gpu,onnx,gguf,opencv-python-headless,insightface \
@@ -232,7 +251,7 @@ RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --index-url "https://download.pytorch.org/whl/${ROCM_VERSION}" \
         torch torchvision torchaudio \
     && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend \
-    && /app/write-torch-constraints.sh \
+    && /usr/local/bin/write-torch-constraints.sh \
     && rm -rf /tmp/uv-cache
 
 FROM base AS auto

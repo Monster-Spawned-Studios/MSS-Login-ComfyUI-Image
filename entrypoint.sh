@@ -3,7 +3,7 @@
 # Starts as root only long enough to chown root-owned volume data to uid 1000
 # and to seed the MSS-Login shadow. The host custom_nodes/MSS-Login checkout
 # is never read, imported, or modified. ComfyUI loads the folder named by
-# MSS_LOGIN_DIR only when that path is a tmpfs; root copies the baked tree
+# custom_nodes/MSS-Login only when that path is a tmpfs; root copies the baked tree
 # onto it, locks it root:root, and checks the baked manifest before setpriv.
 # Custom-node requirements are installed only for names in the baked allowlist,
 # as uid 1000, under image constraints.
@@ -11,9 +11,26 @@ set -euo pipefail
 
 # Bytecode must not be written next to mounted source. This is container-local
 # and is not under custom_nodes, models, or mss-data. Set before any Python.
+# prepare_as_root recreates it mode 0700 and owned by uid 1000. Do not use 1777.
 export PYTHONPYCACHEPREFIX=/tmp/comfy-pycache
-mkdir -p "$PYTHONPYCACHEPREFIX"
-chmod 1777 "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
+
+comfy_python() {
+  if command -v python >/dev/null 2>&1; then
+    python --check-hash-based-pycs always "$@"
+  else
+    python3 --check-hash-based-pycs always "$@"
+  fi
+}
+
+reset_comfy_pycache() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    return 0
+  fi
+  rm -rf "$PYTHONPYCACHEPREFIX"
+  mkdir -p "$PYTHONPYCACHEPREFIX"
+  chown "${COMFY_UID}:${COMFY_GID}" "$PYTHONPYCACHEPREFIX"
+  chmod 0700 "$PYTHONPYCACHEPREFIX"
+}
 
 COMFY_UID=1000
 COMFY_GID=1000
@@ -154,16 +171,29 @@ load_root_fingerprints() {
   shopt -u nullglob
 }
 
+# git as uid 1000. Root must not read node git metadata. safe.directory is
+# only the directory being inspected, not a global wildcard.
+git_as_comfy() {
+  local dir="$1"
+  shift
+  if [[ "$(id -u)" -eq 0 ]]; then
+    setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- \
+      git -C "$dir" -c "safe.directory=${dir}" "$@"
+    return
+  fi
+  git -C "$dir" -c "safe.directory=${dir}" "$@"
+}
+
 git_remote_matches_mss_login() {
   local dir="$1"
   local canon top url
   [[ -d "$dir" && ! -L "$dir" ]] || return 1
   canon="$(realpath "$dir")"
-  top="$(git -C "$canon" -c safe.directory="$canon" rev-parse --show-toplevel 2>/dev/null || true)"
+  top="$(git_as_comfy "$canon" rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$top" ]] || return 1
   top="$(realpath "$top")"
   [[ "$top" == "$canon" ]] || return 1
-  url="$(git -C "$canon" -c safe.directory="$canon" remote get-url origin 2>/dev/null || true)"
+  url="$(git_as_comfy "$canon" remote get-url origin 2>/dev/null || true)"
   [[ "$url" == *ComfyUI-MSS-Login* || "$url" == *"/MSS-Login"* || "$url" == *":MSS-Login"* ]]
 }
 
@@ -237,12 +267,21 @@ refuse_mss_login() {
   exit 1
 }
 
+mss_login_folder_name() {
+  # Production always loads custom_nodes/MSS-Login. Tests may set MSS_LOGIN_DIR.
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_LOGIN_DIR:-}" ]]; then
+    printf '%s\n' "$MSS_LOGIN_DIR"
+    return 0
+  fi
+  printf '%s\n' "MSS-Login"
+}
+
 mss_login_shadow_dest() {
   local nodes_root base
   nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
-  base="${MSS_LOGIN_DIR:-MSS-Login}"
+  base="$(mss_login_folder_name)"
   if [[ -z "$base" || "$base" == "." || "$base" == ".." || "$base" == *"/"* || "$base" == *$'\n'* ]]; then
-    echo "[comfyui-deploy] MSS_LOGIN_DIR must be a single folder name." >&2
+    echo "[comfyui-deploy] MSS-Login folder name must be a single path segment." >&2
     return 1
   fi
   printf '%s\n' "${nodes_root}/${base}"
@@ -265,11 +304,13 @@ unescape_mount_field() {
   printf '%s' "$value"
 }
 
-# Last mountinfo entry whose mount point is exactly $1. Field 5 is the
-# mount point; the fstype is the token after " - ".
-mount_fstype() {
-  local want="$1"
-  local info line point fstype last=""
+# Last mountinfo entry whose mount point is exactly $1.
+# Field 4 is the mount root inside the filesystem. Field 5 is the mount point.
+# The fstype is the token after " - ". A direct tmpfs has mount root "/".
+# A bind of a subdirectory does not.
+mount_info_at() {
+  local want="$1" which="$2"
+  local info line point fstype root last_fs="" last_root=""
   info="$(mss_mountinfo_file)"
   [[ -r "$info" ]] || return 1
   want="$(realpath -m "$want")"
@@ -279,12 +320,41 @@ mount_fstype() {
     point="$(unescape_mount_field "$point")"
     point="$(realpath -m "$point")"
     [[ "$point" == "$want" ]] || continue
+    root="$(awk '{print $4}' <<<"$line")"
+    root="$(unescape_mount_field "$root")"
     fstype="${line#* - }"
     fstype="${fstype%% *}"
-    last="$fstype"
+    last_fs="$fstype"
+    last_root="$root"
   done <"$info"
-  [[ -n "$last" ]] || return 1
-  printf '%s\n' "$last"
+  [[ -n "$last_fs" ]] || return 1
+  if [[ "$which" == "root" ]]; then
+    printf '%s\n' "$last_root"
+  else
+    printf '%s\n' "$last_fs"
+  fi
+}
+
+mount_fstype() {
+  mount_info_at "$1" fstype
+}
+
+mount_root_field() {
+  mount_info_at "$1" root
+}
+
+shadow_mount_is_direct_tmpfs() {
+  local dest="$1" fstype root
+  if ! fstype="$(mount_fstype "$dest")"; then
+    echo "MSS-Login shadow at ${dest} is not mounted. Refusing to read or import the host directory."
+    return 1
+  fi
+  root="$(mount_root_field "$dest")"
+  if [[ "$fstype" != "tmpfs" || "$root" != "/" ]]; then
+    echo "MSS-Login shadow at ${dest} is not tmpfs (fstype ${fstype:-missing}, mount root ${root:-missing}). Refusing to read or import the host directory."
+    return 1
+  fi
+  return 0
 }
 
 mss_login_manifest_file() {
@@ -330,40 +400,73 @@ manifest_path_ok() {
 
 copy_manifest_tree() {
   local src="$1" dest="$2" manifest="$3"
-  local line hash rel parent
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    hash="${line%% *}"
-    rel="$(manifest_rel_path "$line")"
+  local rel parent
+  [[ -f "${manifest}.dirs" && -f "${manifest}.entries" ]] || return 1
+  while IFS= read -r rel || [[ -n "$rel" ]]; do
+    [[ -z "$rel" || "$rel" == \#* ]] && continue
     manifest_path_ok "$rel" || return 1
-    [[ -f "${src}/${rel}" && ! -L "${src}/${rel}" ]] || return 1
+    mkdir -p "${dest}/${rel}" || return 1
+  done <"${manifest}.dirs"
+  while IFS= read -r rel || [[ -n "$rel" ]]; do
+    [[ -z "$rel" || "$rel" == \#* ]] && continue
+    manifest_path_ok "$rel" || return 1
     parent="$(dirname "$rel")"
     mkdir -p "${dest}/${parent}" || return 1
-    cp -P -- "${src}/${rel}" "${dest}/${rel}" || return 1
-  done <"$manifest"
+    if [[ -L "${src}/${rel}" || -f "${src}/${rel}" ]]; then
+      cp -P -- "${src}/${rel}" "${dest}/${rel}" || return 1
+    elif [[ -p "${src}/${rel}" ]]; then
+      mkfifo "${dest}/${rel}" || return 1
+    else
+      return 1
+    fi
+  done <"${manifest}.entries"
+}
+
+list_shadow_nondirs() {
+  local dest="$1"
+  (
+    cd "$dest" || exit 1
+    find . \
+      \( -path './.git' -o -path '*/__pycache__' \) -prune -o \
+      ! -type d ! -name '*.pyc' ! -name '*.pyo' -print \
+      | sed 's|^\./||' \
+      | sort
+  )
+}
+
+list_shadow_dirs() {
+  local dest="$1"
+  (
+    cd "$dest" || exit 1
+    find . \
+      \( -path './.git' -o -path '*/__pycache__' \) -prune -o \
+      -type d -print \
+      | sed 's|^\./||' \
+      | sed '/^$/d' \
+      | sort
+  )
 }
 
 verify_manifest() {
   local dest="$1" manifest="$2"
-  local list_got list_want line rel
+  local list_got
+  [[ -f "${manifest}.entries" && -f "${manifest}.dirs" ]] || return 1
   list_got="$(mktemp)"
-  list_want="$(mktemp)"
-  (
-    cd "$dest" || exit 1
-    find . -type f -print | sed 's|^\./||' | sort
-  ) >"$list_got"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    rel="$(manifest_rel_path "$line")"
-    printf '%s\n' "$rel"
-  done <"$manifest" | sort >"$list_want"
-  if ! diff -q "$list_want" "$list_got" >/dev/null 2>&1; then
-    echo "[comfyui-deploy] Shadow file list does not match the baked manifest." >&2
-    diff -u "$list_want" "$list_got" >&2 || true
-    rm -f "$list_got" "$list_want"
+  list_shadow_nondirs "$dest" >"$list_got"
+  if ! diff -q "${manifest}.entries" "$list_got" >/dev/null 2>&1; then
+    echo "[comfyui-deploy] Shadow non-directory list does not match the baked manifest." >&2
+    diff -u "${manifest}.entries" "$list_got" >&2 || true
+    rm -f "$list_got"
     return 1
   fi
-  rm -f "$list_got" "$list_want"
+  list_shadow_dirs "$dest" >"$list_got"
+  if ! diff -q "${manifest}.dirs" "$list_got" >/dev/null 2>&1; then
+    echo "[comfyui-deploy] Shadow directory list does not match the baked manifest." >&2
+    diff -u "${manifest}.dirs" "$list_got" >&2 || true
+    rm -f "$list_got"
+    return 1
+  fi
+  rm -f "$list_got"
   if ! (cd "$dest" && sha256sum --quiet -c "$manifest"); then
     echo "[comfyui-deploy] Shadow hashes do not match the baked manifest." >&2
     return 1
@@ -507,13 +610,10 @@ reject_other_mss_login_copies() {
 }
 
 prepare_mss_login() {
-  local dest fstype
+  local dest reason
   dest="$(mss_login_shadow_dest)" || exit 1
-  if ! fstype="$(mount_fstype "$dest")"; then
-    refuse_mss_login "MSS-Login shadow at ${dest} is not mounted. Refusing to read or import the host directory."
-  fi
-  if [[ "$fstype" != "tmpfs" ]]; then
-    refuse_mss_login "MSS-Login shadow at ${dest} is fstype ${fstype}, not tmpfs. Refusing to read or import the host directory."
+  if ! reason="$(shadow_mount_is_direct_tmpfs "$dest")"; then
+    refuse_mss_login "$reason"
   fi
   reject_other_mss_login_copies "$dest"
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -710,19 +810,18 @@ install_custom_node_deps() {
 }
 
 prepare_as_root() {
-  local dest fstype
+  local dest reason
   export HOME=/home/comfy
   export USER=comfy
   export LOGNAME=comfy
 
+  reset_comfy_pycache
+
   # Confirm the shadow mount before chown -R. A missing tmpfs would otherwise
   # let chown walk the host MSS-Login checkout that the mount is supposed to hide.
   dest="$(mss_login_shadow_dest)" || exit 1
-  if ! fstype="$(mount_fstype "$dest")"; then
-    refuse_mss_login "MSS-Login shadow at ${dest} is not mounted. Refusing to read or import the host directory."
-  fi
-  if [[ "$fstype" != "tmpfs" ]]; then
-    refuse_mss_login "MSS-Login shadow at ${dest} is fstype ${fstype}, not tmpfs. Refusing to read or import the host directory."
+  if ! reason="$(shadow_mount_is_direct_tmpfs "$dest")"; then
+    refuse_mss_login "$reason"
   fi
   if dir_has_entries "$dest"; then
     refuse_mss_login "tmpfs at ${dest} is not empty before seeding."
@@ -739,25 +838,20 @@ prepare_as_root() {
   ensure_owned /home/comfy/.cache/torch/hub
   ensure_owned /home/comfy/.bashrc file
 
-  # ensure_owned chowns the empty tmpfs to uid 1000. Seed after that and
-  # lock the copy back to root:root before setpriv.
+  # ensure_owned walks custom_nodes and chowns the still-empty tmpfs to uid
+  # 1000. prepare_mss_login then copies the pin and locks that tree root:root
+  # before setpriv. The mounted .bashrc is not sourced.
   prepare_mss_login
 }
 
 # MSS-Login 1d9acbc reads auto_update from DATA_DIR/config.json, not from an
-# environment variable. enabled=false skips update_check_loop. mode "off" is
-# neither "notify" nor "auto", so run_update_check returns before git pull.
-# POST /mss-login/api/update-apply does not read this key. No stack variable
-# can turn it back on; MSS_LOGIN_TEST_MODE does not either.
-force_mss_login_auto_update_off() {
-  local data py
+# environment variable. enabled stays true and mode is notify, so a new
+# release is still reported. mode auto is not used. There is no stack
+# variable that changes this. python -S avoids a uid-1000 sitecustomize.
+force_mss_login_auto_update_notify() {
+  local data
   data="${MSS_LOGIN_DATA_DIR:-/data/mss-login}"
-  if command -v python3 >/dev/null 2>&1; then
-    py=python3
-  else
-    py=python
-  fi
-  "$py" - "$data" <<'PY'
+  comfy_python -S - "$data" <<'PY'
 import json
 import os
 import sys
@@ -781,8 +875,8 @@ if os.path.isfile(path):
 auto_update = cfg.get("auto_update")
 if not isinstance(auto_update, dict):
     auto_update = {}
-auto_update["enabled"] = False
-auto_update["mode"] = "off"
+auto_update["enabled"] = True
+auto_update["mode"] = "notify"
 cfg["auto_update"] = auto_update
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
@@ -790,7 +884,7 @@ with open(tmp, "w", encoding="utf-8") as handle:
     handle.write("\n")
 os.replace(tmp, path)
 PY
-  echo "[comfyui-deploy] MSS-Login auto_update in ${data}/config.json is enabled=false, mode=off. Update now is not gated by that key."
+  echo "[comfyui-deploy] MSS-Login auto_update in ${data}/config.json is enabled=true, mode=notify. In-place update is refused by the image patch."
 }
 
 warn_if_insightface_models_missing() {
@@ -843,6 +937,121 @@ prepend_cuda_library_path() {
   echo "[comfyui-deploy] CUDA/cuDNN libraries prefer the venv wheels."
 }
 
+# Flags from ComfyUI comfy/cli_args.py at 0dbfd493b4cc604db743c699f0f7ce01348e54a4
+# that change which nodes load or where custom_nodes, models, or user data live.
+cli_node_path_flag_denied() {
+  case "$1" in
+    --disable-all-custom-nodes|--disable-all-custom-nodes=*|\
+    --whitelist-custom-nodes|--whitelist-custom-nodes=*|\
+    --enable-manager|--enable-manager=*|\
+    --enable-manager-legacy-ui|--enable-manager-legacy-ui=*|\
+    --disabled-nodes-config|--disabled-nodes-config=*|\
+    --disable-partner-nodes|--disable-partner-nodes=*|\
+    --disable-api-nodes|--disable-api-nodes=*|\
+    --offline|--offline=*|\
+    --base-directory|--base-directory=*|\
+    --extra-model-paths-config|--extra-model-paths-config=*|\
+    --output-directory|--output-directory=*|\
+    --temp-directory|--temp-directory=*|\
+    --input-directory|--input-directory=*|\
+    --previews-directory|--previews-directory=*|\
+    --user-directory|--user-directory=*|\
+    --models-directory|--models-directory=*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+refuse_cli_node_path_flags() {
+  local arg
+  local -a args=()
+  read -r -a args <<< "${CLI_ARGS:-} $*"
+  for arg in "${args[@]}"; do
+    if cli_node_path_flag_denied "$arg"; then
+      refuse_mss_login "Refusing CLI flag ${arg%%=*}. It changes custom-node loading or a base path. Refused flags: --disable-all-custom-nodes, --whitelist-custom-nodes, --enable-manager, --enable-manager-legacy-ui, --disabled-nodes-config, --disable-partner-nodes, --disable-api-nodes, --offline, --base-directory, --extra-model-paths-config, --output-directory, --temp-directory, --input-directory, --previews-directory, --user-directory, --models-directory."
+    fi
+  done
+}
+
+extra_model_paths_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_EXTRA_MODEL_PATHS:-}" ]]; then
+    printf '%s\n' "$MSS_EXTRA_MODEL_PATHS"
+  else
+    printf '%s\n' "/app/ComfyUI/extra_model_paths.yaml"
+  fi
+}
+
+refuse_extra_model_paths_custom_nodes() {
+  local path status
+  path="$(extra_model_paths_file)"
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$path" ]]; then
+    refuse_mss_login "${path} is not a file. Refusing to start."
+  fi
+  set +e
+  comfy_python - "$path" <<'PY'
+import sys
+
+path = sys.argv[1]
+try:
+    import yaml
+except Exception:
+    sys.stderr.write("PyYAML is not importable; refusing to guess extra_model_paths.yaml.\n")
+    sys.exit(2)
+
+def has_custom_nodes(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key) == "custom_nodes" or has_custom_nodes(value):
+                return True
+        return False
+    if isinstance(node, list):
+        return any(has_custom_nodes(item) for item in node)
+    return False
+
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+except Exception as exc:
+    sys.stderr.write(f"extra_model_paths.yaml could not be parsed: {exc}\n")
+    sys.exit(3)
+if has_custom_nodes(data):
+    sys.exit(4)
+sys.exit(0)
+PY
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    refuse_mss_login "extra_model_paths.yaml at ${path} is unreadable, unparsable, or contains a custom_nodes key."
+  fi
+}
+
+mss_login_route_ok() {
+  case "$1" in
+    200|301|302) return 0 ;;
+  esac
+  return 1
+}
+
+wait_for_mss_login_route() {
+  local port code n=0
+  port="${1:-9008}"
+  while [[ "$n" -lt 60 ]]; do
+    n=$((n + 1))
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/login" || true)"
+    if mss_login_route_ok "$code"; then
+      echo "[comfyui-deploy] MSS-Login GET /login returned ${code}."
+      return 0
+    fi
+    sleep 5
+  done
+  echo "[comfyui-deploy] MSS-Login GET /login last status was ${code:-none}." >&2
+  return 1
+}
+
 launch_comfyui() {
   local detect_line
   echo "[comfyui-deploy] Initializing ComfyUI (${OS} / ${ARCH}, DEVICE_TYPE=${DEVICE_TYPE}, USE_CPU=${USE_CPU})."
@@ -855,11 +1064,11 @@ launch_comfyui() {
   require_writable /app/ComfyUI/user
 
   warn_if_insightface_models_missing
-  force_mss_login_auto_update_off
+  force_mss_login_auto_update_notify
   prepare_mss_login
 
   detect_line="$(
-    python - <<'PY'
+    comfy_python - <<'PY'
 import os
 import sys
 
@@ -885,7 +1094,7 @@ PY
 
   local torch_ok=0
   if [[ "$FORCE_REINSTALL_TORCH" != "1" && "$current_backend" == "$TARGET_BACKEND" ]]; then
-    if python -c "import torch, torchvision, torchaudio" &>/dev/null; then
+    if comfy_python -c "import torch, torchvision, torchaudio" &>/dev/null; then
       torch_ok=1
     fi
   fi
@@ -939,11 +1148,23 @@ PY
 
   prepend_cuda_library_path
 
+  refuse_cli_node_path_flags "$@"
+  refuse_extra_model_paths_custom_nodes
+
   cd /app/ComfyUI
   echo "[comfyui-deploy] Launching ComfyUI with args: ${CLI_ARGS} $*"
   # CLI_ARGS is a space-separated argument string from the compose file.
   # shellcheck disable=SC2086
-  exec python main.py $CLI_ARGS "$@"
+  comfy_python main.py $CLI_ARGS "$@" &
+  local child=$!
+  trap 'kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true' TERM INT
+  if ! wait_for_mss_login_route 9008; then
+    echo "[comfyui-deploy] Stopping. MSS-Login GET /login did not return 200, 301, or 302 within 300s." >&2
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    exit 1
+  fi
+  wait "$child"
 }
 
 main() {

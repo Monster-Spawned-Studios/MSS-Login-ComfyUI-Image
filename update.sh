@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Manual in-container updater for ComfyUI core and PyTorch wheels.
-# Does not fetch, reset, or overwrite MSS-Login. Replace that pin by
-# building a new image. If docker exec starts this script as root, it drops
-# to uid 1000 before writing into the venv.
+# Does not fetch, reset, or overwrite MSS-Login. That pin changes only when
+# a new image is built with a new MSS_LOGIN_REF. See README "Updating MSS-Login".
+# If docker exec starts this script as root, it drops to uid 1000 before
+# writing into the venv. It does not re-check the shadow mount: the running
+# container already seeded it, and an empty-tmpfs check would refuse here.
 set -euo pipefail
 
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -18,13 +20,13 @@ VENV_DIR="${VIRTUAL_ENV:-/app/ComfyUI/.venv}"
 STAMP_FILE="${VENV_DIR}/.mss_torch_backend"
 # shellcheck source=entrypoint.sh
 source "$(dirname "$(readlink -f "$0")")/entrypoint.sh"
-prepare_mss_login
-echo "[comfyui-deploy] MSS-Login shadow at ${MSS_DIR} is left as-is."
+export MSS_DIR="${NODES_DIR:-/app/ComfyUI/custom_nodes}/MSS-Login"
+echo "[comfyui-deploy] MSS-Login is not updated by this script. Rebuild the image with a new MSS_LOGIN_REF."
 echo "[comfyui-deploy] Checking for ComfyUI updates via comfy-cli (${OS} / ${ARCH})..."
 comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI update comfy
 
 detect_line="$(
-  python - <<'PY'
+  comfy_python - <<'PY'
 import os
 import sys
 
@@ -62,4 +64,4 @@ fi
 
 mkdir -p "$(dirname "$STAMP_FILE")"
 printf '%s\n' "$TARGET_BACKEND" >"$STAMP_FILE"
-echo "[comfyui-deploy] Update completed (backend: ${TARGET_BACKEND})."
+echo "[comfyui-deploy] Update completed (backend: ${TARGET_BACKEND}). MSS-Login was not changed."
