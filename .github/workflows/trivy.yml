@@ -42,7 +42,7 @@ jobs:
 
       - name: Run Trivy Config Scan (Dockerfile & Compose misconfigurations)
         id: trivy_config
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
         continue-on-error: true
         with:
           scan-type: "config"
@@ -54,7 +54,7 @@ jobs:
 
       - name: Run Trivy Filesystem & Secret Scan
         id: trivy_fs
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
         continue-on-error: true
         with:
           scan-type: "fs"
