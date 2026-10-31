@@ -70,19 +70,23 @@ Leave `COMPOSE_PROFILES` unset to keep the tunnel off.
 
 The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. Startup accepts a host copy only when all of these hold:
 
-- `diff -rq --exclude=.git --exclude=__pycache__ --exclude='*.pyc' --no-dereference` against `/opt/mss-login/ComfyUI-MSS-Login` is empty
+- `diff -rq --exclude=.git --no-dereference` against `/opt/mss-login/ComfyUI-MSS-Login` is empty. `__pycache__`, `.pyc`, and `.pyo` are part of that comparison.
+- the host tree contains no `__pycache__` directory and no `.pyc` or `.pyo` file
 - `git rev-parse --show-toplevel` is that directory, not a parent repo
 - `git cat-file -e <revision>^{commit}` succeeds and `HEAD` is that commit
-- `git status --porcelain --untracked-files=all` is empty
+- `git status --porcelain --untracked-files=all --ignored` is empty, so a gitignored file cannot hide
 
-A dirty file, an untracked file, a forged `.git/HEAD` with no commit object, or a renamed-but-edited tree refuses to start. The host files are not overwritten. A second copy, including one found by a baked file hash or by a git remote of `ComfyUI-MSS-Login`, also refuses to start.
+A dirty file, an untracked file, a gitignored file, a planted `.pyc`, a forged `.git/HEAD` with no commit object, or a renamed-but-edited tree refuses to start. The host files are not overwritten. A second copy, including one found by a baked file hash or by a git remote of `ComfyUI-MSS-Login`, also refuses to start.
+
+Python bytecode for the app is written only under `PYTHONPYCACHEPREFIX=/tmp/comfy-pycache`. That directory is not a host mount and is not under mss-data. The image sets it, and the entrypoint sets it again before any `python` or `uv` command, so a `.pyc` beside the mounted source is not imported.
 
 `MSS_LOGIN_DIR` (default `MSS-Login`) is only the folder used when nothing matches. An exact copy under another folder name is reused.
 
-There is no stack variable to disable the pin. Emergency only, for one container start:
+There is no stack variable and no file on the mss-data volume that disables the pin. A file named `MSS_LOGIN_BREAK_GLASS` is ignored. The only emergency path is a one-off process:
 
-- create the file `MSS_LOGIN_BREAK_GLASS` inside the MSS-Login data directory (`/data/mss-login` in the container, the `mss-data` host mount), or
-- `docker run -e MSS_LOGIN_ALLOW_UNPINNED=true` for a one-off process
+```bash
+docker run -e MSS_LOGIN_ALLOW_UNPINNED=true ...
+```
 
 Do not add that variable to the Portainer stack. Rebuild with a new `MSS_LOGIN_REF` to change what is allowed to run.
 
@@ -92,7 +96,7 @@ Do not add that variable to the Portainer stack. Rebuild with a new `MSS_LOGIN_R
 
 Stamps live in the venv (`.mss-node-dep-stamps`) and include the image revision, the constraints hash, and `/app/ComfyUI/.venv/.mss-build-id`, so a new image reinstalls.
 
-Requirement lines that are options, nested includes, editable installs, local paths, or any URL are dropped and logged. Installs use PyPI only, as uid 1000.
+Requirement lines that are options, nested includes, editable installs, local paths, path separators, wheels, sdists (`.whl`, `.zip`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`), or any URL are dropped and logged. Installs use PyPI only, as uid 1000.
 
 `comfyui_ryanonyheinside` and `comfyui-supir` have a `requirements.txt` but no verifiable git remote, so they are not on the allowlist. Workflows that import them will fail until that list is updated.
 

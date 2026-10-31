@@ -23,6 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/app/ComfyUI/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
     MSS_LOGIN_SEED=/opt/mss-login/ComfyUI-MSS-Login \
     MSS_LOGIN_DATA_DIR=/data/mss-login \
+    PYTHONPYCACHEPREFIX=/tmp/comfy-pycache \
     DEVICE_TYPE=auto
 
 # curl is the container healthcheck client. git fetches the pinned custom node.
@@ -99,6 +100,8 @@ RUN mkdir -p \
         /home/comfy/.cache/torch/hub \
         /home/comfy/user-scripts \
         /opt/comfy-constraints \
+        /tmp/comfy-pycache \
+    && chmod 1777 /tmp/comfy-pycache \
     && /app/write-torch-constraints.sh \
     && cp /opt/mss-login/REVISION /app/ComfyUI/.venv/.mss-build-id \
     && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/mss-login /opt/uv-python /opt/uv-tools /opt/comfy-constraints

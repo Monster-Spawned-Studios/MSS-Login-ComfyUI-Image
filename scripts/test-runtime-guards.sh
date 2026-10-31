@@ -93,6 +93,10 @@ EOF
   filter_requirements_file "$src" "$dest" "Demo" false 2>"$err"
   assert_eq "$(grep -vx six "$dest" || true)" "" "adversarial lines must not be kept"
   grep -qx six "$dest" || fail "six was dropped"
+  printf '%s\n' 'evil-1.0-py3-none-any.whl' 'Pkg-1.0.TAR.GZ' 'foo/bar' 'six' >"$src"
+  filter_requirements_file "$src" "$dest" "Demo" false 2>"$err"
+  assert_eq "$(grep -vx six "$dest" || true)" "" "wheel, sdist, and path tokens must be dropped"
+  grep -qx six "$dest" || fail "six was dropped with the wheel"
   rm -f "$src" "$dest" "$err"
   echo "filter case passed"
 }
@@ -364,6 +368,75 @@ mismatch_case() {
   echo "unpinned opt-out case passed"
 }
 
+bytecode_and_breakglass_cases() {
+  local base seed nodes rev sha data log status
+  base="$(new_case)"
+  seed="${base}/seed"
+  nodes="${base}/custom_nodes"
+  rev="${base}/REVISION"
+  data="${base}/data"
+  mkdir -p "$nodes" "$data"
+  make_plugin "$seed"
+  sha="$(git -C "$seed" rev-parse HEAD)"
+  printf '%s\n' "$sha" >"$rev"
+  cp -a "$seed" "${nodes}/MSS-Login"
+  mkdir -p "${nodes}/MSS-Login/__pycache__"
+  printf 'not-bytecode\n' >"${nodes}/MSS-Login/__pycache__/mss_login.cpython-313.pyc"
+  log="$(mktemp)"
+  set +e
+  (
+    MSS_LOGIN_SEED="$seed" MSS_LOGIN_REVISION_FILE="$rev" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "planted pyc was allowed: $(cat "$log")"
+  grep -q 'Refusing' "$log" || fail "pyc plant missing Refusing"
+  rm -rf "${nodes}/MSS-Login/__pycache__"
+
+  printf '%s\n' '*.secret' >"${nodes}/MSS-Login/.gitignore"
+  git -C "${nodes}/MSS-Login" add .gitignore
+  git -C "${nodes}/MSS-Login" commit -q -m 'ignore secrets'
+  # The pin is the original commit. Move HEAD back so the only extra content is ignored.
+  git -C "${nodes}/MSS-Login" reset -q --hard "$sha"
+  printf 'hidden\n' >"${nodes}/MSS-Login/creds.secret"
+  # .gitignore from the later commit is gone after reset. Install the ignore rule in the index commit that matches the seed.
+  # Re-apply an ignore that exists in the pinned tree by using exclude, which status --ignored still reports.
+  mkdir -p "${nodes}/MSS-Login/.git/info"
+  printf '%s\n' 'creds.secret' >>"${nodes}/MSS-Login/.git/info/exclude"
+  log="$(mktemp)"
+  set +e
+  (
+    MSS_LOGIN_SEED="$seed" MSS_LOGIN_REVISION_FILE="$rev" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "gitignored file was allowed: $(cat "$log")"
+  grep -q 'Refusing' "$log" || fail "gitignored file missing Refusing"
+
+  touch "${data}/MSS_LOGIN_BREAK_GLASS"
+  echo 'print("backdoor")' >>"${nodes}/MSS-Login/mss_login.py"
+  log="$(mktemp)"
+  set +e
+  (
+    MSS_LOGIN_SEED="$seed" \
+      MSS_LOGIN_REVISION_FILE="$rev" \
+      NODES_DIR="$nodes" \
+      MSS_LOGIN_DIR="MSS-Login" \
+      MSS_LOGIN_DATA_DIR="$data" \
+      prepare_mss_login
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "break-glass file was honored: $(cat "$log")"
+  if grep -q 'break-glass is enabled' "$log"; then
+    fail "break-glass file produced the bypass warning"
+  fi
+  rm -f "$log"
+  rm -rf "$base"
+  [[ "${PYTHONPYCACHEPREFIX:-}" == "/tmp/comfy-pycache" ]] || fail "PYTHONPYCACHEPREFIX was not set by the entrypoint"
+  echo "bytecode and break-glass cases passed"
+}
+
 filter_case
 cache_case
 seed_case
@@ -372,4 +445,5 @@ remote_only_case
 two_copies_case
 mismatch_case
 attack_cases
+bytecode_and_breakglass_cases
 echo "all runtime guard tests passed"

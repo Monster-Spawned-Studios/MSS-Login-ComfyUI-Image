@@ -7,6 +7,12 @@
 # for names in the baked allowlist, as uid 1000, under image constraints.
 set -euo pipefail
 
+# Bytecode must not be written next to mounted source. This is container-local
+# and is not under custom_nodes, models, or mss-data. Set before any Python.
+export PYTHONPYCACHEPREFIX=/tmp/comfy-pycache
+mkdir -p "$PYTHONPYCACHEPREFIX"
+chmod 1777 "$PYTHONPYCACHEPREFIX" 2>/dev/null || true
+
 COMFY_UID=1000
 COMFY_GID=1000
 CLI_ARGS="${CLI_ARGS:---listen 0.0.0.0 --port 9008}"
@@ -215,7 +221,8 @@ log_mss_login_remote() {
 
 seed_mss_login_into() {
   local dest="$1"
-  local seed="${MSS_LOGIN_SEED:-/opt/mss-login/ComfyUI-MSS-Login}"
+  local seed
+  seed="$(mss_login_baked_root)"
   if dir_has_entries "$dest"; then
     echo "[comfyui-deploy] ${dest} is not empty and is not an MSS-Login package; not overwriting it." >&2
     return 1
@@ -230,13 +237,16 @@ seed_mss_login_into() {
 }
 
 mss_login_break_glass() {
-  if [[ -f "${MSS_LOGIN_DATA_DIR:-/data/mss-login}/MSS_LOGIN_BREAK_GLASS" ]]; then
-    return 0
-  fi
-  if is_truthy "${MSS_LOGIN_ALLOW_UNPINNED:-false}"; then
-    return 0
-  fi
-  return 1
+  # Emergency only via the process environment (docker run -e). A file on the
+  # mss-data volume is ignored; uid 1000 can write that mount.
+  is_truthy "${MSS_LOGIN_ALLOW_UNPINNED:-false}"
+}
+
+host_tree_has_bytecode() {
+  local dir="$1"
+  local hit
+  hit="$(find -P "$dir" \( -name .git -prune \) -o \( -type d -name __pycache__ -o -type f -iname '*.pyc' -o -type f -iname '*.pyo' \) -print -quit)"
+  [[ -n "$hit" ]]
 }
 
 # Content plus a real commit. HEAD text alone is not enough.
@@ -247,7 +257,10 @@ exact_mss_login_copy() {
   canon="$(realpath "$dir")"
   baked="$(mss_login_baked_root)"
   [[ -d "$baked" ]] || return 1
-  if ! diff -rq --exclude=.git --exclude=__pycache__ --exclude='*.pyc' --no-dereference "$baked" "$canon" >/dev/null 2>&1; then
+  if host_tree_has_bytecode "$canon"; then
+    return 1
+  fi
+  if ! diff -rq --exclude=.git --no-dereference "$baked" "$canon" >/dev/null 2>&1; then
     return 1
   fi
   if [[ ! -f "$(mss_login_revision_file)" ]]; then
@@ -270,7 +283,7 @@ exact_mss_login_copy() {
   actual="$(printf '%s' "$actual" | tr -d '[:space:]')"
   actual="${actual,,}"
   [[ "$actual" == "$expected" ]] || return 1
-  status="$(git -C "$canon" -c safe.directory="$canon" status --porcelain --untracked-files=all 2>/dev/null || true)"
+  status="$(git -C "$canon" -c safe.directory="$canon" status --porcelain --untracked-files=all --ignored 2>/dev/null || true)"
   [[ -z "$status" ]] || return 1
   return 0
 }
@@ -337,7 +350,7 @@ prepare_mss_login() {
     fi
     if mss_login_break_glass; then
       log_pin_facts "$MSS_LOGIN_RUNTIME_DIR"
-      echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED break-glass is enabled for ${MSS_LOGIN_RUNTIME_DIR}. The tree does not match the image pin. This is an emergency bypass, not a normal start. The host checkout was not modified." >&2
+      echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED=true is set for ${MSS_LOGIN_RUNTIME_DIR}. The tree does not match the image pin. This environment variable is an emergency bypass, not a normal start. The host checkout was not modified." >&2
       return 0
     fi
     log_pin_facts "$MSS_LOGIN_RUNTIME_DIR"
@@ -366,6 +379,13 @@ requirement_line_rejected() {
   [[ "$line" == *"://"* || "$line" == *git+* || "$line" == *"@"* || "$line" == *\\* ]] && return 0
   [[ "$line" == /* || "$line" == ./* || "$line" == ../* || "$line" == "~"* ]] && return 0
   [[ "$line" == *"/../"* || "$line" == *"../"* ]] && return 0
+  [[ "$lower" =~ \.(whl|zip|tar\.gz|tgz|tar\.bz2|tar\.xz)$ ]] && return 0
+  local token
+  local -a tokens=()
+  read -r -a tokens <<< "$line"
+  for token in "${tokens[@]}"; do
+    [[ "$token" == */* || "$token" == *\\* ]] && return 0
+  done
   return 1
 }
 
