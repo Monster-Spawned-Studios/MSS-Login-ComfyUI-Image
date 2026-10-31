@@ -88,6 +88,80 @@ COPY --chmod=755 scripts/write-mss-login-manifest.sh /usr/local/bin/write-mss-lo
 COPY --chmod=755 scripts/mss-login-healthcheck /usr/local/bin/mss-login-healthcheck
 COPY patches/mss-login-no-inplace-update.patch /opt/mss-login/patches/mss-login-no-inplace-update.patch
 COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
+COPY patches/mss-login-manager-owner-gate.patch /opt/mss-login/patches/mss-login-manager-owner-gate.patch
+COPY patches/comfyui-manager-mss-lockdown.patch /opt/comfyui-manager/patches/comfyui-manager-mss-lockdown.patch
+COPY config/comfyui-manager-requirements.lock /opt/comfyui-manager/requirements.lock
+
+# ComfyUI-Manager, owner-only and read-only. Pinned to release tag 4.3. The
+# tag, the commit, and the commit's tree hash must all match before anything
+# is built. patches/comfyui-manager-mss-lockdown.patch is applied with
+# git apply --check first. The wheel is built here, its sha256 is recorded,
+# and it is installed with --require-hashes --no-deps into the root-owned
+# /opt/comfyui-manager/site (not the uid 1000 venv). The entrypoint puts that
+# directory on PYTHONPATH for the uid 1000 ComfyUI process only and checks
+# /opt/comfyui-manager/MANIFEST before setpriv. Manager's own Python imports
+# come from config/comfyui-manager-requirements.lock (exact pins, hashes).
+# Bumping the pin: change VERSION, REF and TREE together, re-check the patch,
+# and send the delta to Security. See README "ComfyUI-Manager (owner only)".
+ARG COMFYUI_MANAGER_REPO=https://github.com/Comfy-Org/ComfyUI-Manager.git
+ARG COMFYUI_MANAGER_VERSION=4.3
+ARG COMFYUI_MANAGER_REF=f764cc0e54ca8cd6e1c6a8ecc005bd574592ca65
+ARG COMFYUI_MANAGER_TREE=b321e15ea7f3fd86bc8f9c0484479a3dc7701721
+RUN if [[ "${COMFYUI_MANAGER_REPO}" != "https://github.com/Comfy-Org/ComfyUI-Manager.git" ]]; then \
+      echo "COMFYUI_MANAGER_REPO must be https://github.com/Comfy-Org/ComfyUI-Manager.git" >&2; \
+      exit 1; \
+    fi \
+    && if [[ ! "${COMFYUI_MANAGER_VERSION}" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then \
+      echo "COMFYUI_MANAGER_VERSION must be a release tag such as 4.3" >&2; \
+      exit 1; \
+    fi \
+    && if [[ ! "${COMFYUI_MANAGER_REF}" =~ ^[0-9a-f]{40}$ || ! "${COMFYUI_MANAGER_TREE}" =~ ^[0-9a-f]{40}$ ]]; then \
+      echo "COMFYUI_MANAGER_REF and COMFYUI_MANAGER_TREE must be full 40-character lowercase SHAs" >&2; \
+      exit 1; \
+    fi \
+    && mkdir -p /opt/comfyui-manager/wheel /opt/comfy-constraints \
+    && /usr/local/bin/write-torch-constraints.sh \
+    && git init --quiet /tmp/comfyui-manager-src \
+    && git -C /tmp/comfyui-manager-src remote add origin "${COMFYUI_MANAGER_REPO}" \
+    && GIT_TERMINAL_PROMPT=0 git -C /tmp/comfyui-manager-src fetch --depth 1 origin \
+         "${COMFYUI_MANAGER_REF}" "+refs/tags/${COMFYUI_MANAGER_VERSION}:refs/tags/${COMFYUI_MANAGER_VERSION}" \
+    && git -C /tmp/comfyui-manager-src checkout --quiet --detach "${COMFYUI_MANAGER_REF}" \
+    && got="$(git -C /tmp/comfyui-manager-src rev-parse HEAD)" \
+    && tag_commit="$(git -C /tmp/comfyui-manager-src rev-parse "refs/tags/${COMFYUI_MANAGER_VERSION}^{commit}")" \
+    && tree="$(git -C /tmp/comfyui-manager-src rev-parse 'HEAD^{tree}')" \
+    && if [[ "${got}" != "${COMFYUI_MANAGER_REF}" || "${tag_commit}" != "${COMFYUI_MANAGER_REF}" ]]; then \
+      echo "ComfyUI-Manager checkout ${got} / tag ${COMFYUI_MANAGER_VERSION} -> ${tag_commit}, wanted ${COMFYUI_MANAGER_REF}" >&2; \
+      exit 1; \
+    fi \
+    && if [[ "${tree}" != "${COMFYUI_MANAGER_TREE}" ]]; then \
+      echo "ComfyUI-Manager tree ${tree}, wanted ${COMFYUI_MANAGER_TREE}" >&2; \
+      exit 1; \
+    fi \
+    && grep -qx "version = \"${COMFYUI_MANAGER_VERSION}\"" /tmp/comfyui-manager-src/pyproject.toml \
+    && git -C /tmp/comfyui-manager-src apply --check /opt/comfyui-manager/patches/comfyui-manager-mss-lockdown.patch \
+    && git -C /tmp/comfyui-manager-src apply /opt/comfyui-manager/patches/comfyui-manager-mss-lockdown.patch \
+    && rm -rf /tmp/comfyui-manager-src/.git \
+    && uv build --wheel --out-dir /opt/comfyui-manager/wheel /tmp/comfyui-manager-src \
+    && rm -rf /tmp/comfyui-manager-src \
+    && whl="$(find /opt/comfyui-manager/wheel -maxdepth 1 -type f -name 'comfyui_manager-*.whl' -print)" \
+    && if [[ -z "${whl}" || "$(printf '%s\n' "${whl}" | wc -l)" -ne 1 ]]; then \
+      echo "expected one comfyui_manager wheel" >&2; \
+      exit 1; \
+    fi \
+    && sha256sum "${whl}" | awk '{print $1}' > /opt/comfyui-manager/WHEEL_SHA256 \
+    && printf 'comfyui-manager @ file://%s --hash=sha256:%s\n' "${whl}" "$(tr -d '[:space:]' < /opt/comfyui-manager/WHEEL_SHA256)" > /opt/comfyui-manager/wheel-requirements.txt \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python --target /opt/comfyui-manager/site \
+         --no-deps --require-hashes -r /opt/comfyui-manager/wheel-requirements.txt \
+    && test -f /opt/comfyui-manager/site/comfyui_manager/mss_lockdown.py \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
+         --constraint /opt/comfy-constraints/torch.txt \
+         --no-deps --require-hashes -r /opt/comfyui-manager/requirements.lock \
+    && printf '%s\n' "${COMFYUI_MANAGER_VERSION}" > /opt/comfyui-manager/VERSION \
+    && printf '%s\n' "${COMFYUI_MANAGER_REF}" > /opt/comfyui-manager/REVISION \
+    && printf '%s\n' "${COMFYUI_MANAGER_TREE}" > /opt/comfyui-manager/TREE \
+    && printf '%s\n' "comfyui-manager-mss-lockdown.patch" > /opt/comfyui-manager/PATCHES \
+    && /usr/local/bin/write-mss-login-manifest.sh /opt/comfyui-manager/site /opt/comfyui-manager/MANIFEST \
+    && rm -rf /tmp/uv-cache
 
 # facebookresearch/sam2 main at the time of this pin. The wheel is built in
 # this stage with CUDA extensions off, hash-checked, and installed with
@@ -147,7 +221,9 @@ RUN mkdir -p \
     && cp /opt/mss-login/REVISION /app/ComfyUI/.venv/.mss-build-id \
     && git -C /opt/mss-login/ComfyUI-MSS-Login apply --check /opt/mss-login/patches/mss-login-no-inplace-update.patch \
     && git -C /opt/mss-login/ComfyUI-MSS-Login apply /opt/mss-login/patches/mss-login-no-inplace-update.patch \
-    && printf '%s\n' "mss-login-no-inplace-update.patch" > /opt/mss-login/PATCHES \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply --check /opt/mss-login/patches/mss-login-manager-owner-gate.patch \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply /opt/mss-login/patches/mss-login-manager-owner-gate.patch \
+    && printf '%s\n' "mss-login-no-inplace-update.patch" "mss-login-manager-owner-gate.patch" > /opt/mss-login/PATCHES \
     && /usr/local/bin/write-mss-login-manifest.sh /opt/mss-login/ComfyUI-MSS-Login /opt/mss-login/MANIFEST \
     && if [[ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2.git" && "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2" ]]; then \
          echo "SAM2_REPO must be https://github.com/facebookresearch/sam2.git" >&2; \
@@ -194,9 +270,9 @@ RUN mkdir -p \
     && chown -R root:root /app/ComfyUI/web_custom_versions /opt/comfy-frontend \
     && find /app/ComfyUI/web_custom_versions /opt/comfy-frontend -type d -exec chmod 755 {} + \
     && find /app/ComfyUI/web_custom_versions /opt/comfy-frontend -type f -exec chmod 644 {} + \
-    && chown -R root:root /opt/mss-login /opt/sam2 \
-    && find /opt/mss-login /opt/sam2 -type d -exec chmod 0755 {} + \
-    && find /opt/mss-login /opt/sam2 -type f -exec chmod 0644 {} + \
+    && chown -R root:root /opt/mss-login /opt/sam2 /opt/comfyui-manager \
+    && find /opt/mss-login /opt/sam2 /opt/comfyui-manager -type d -exec chmod 0755 {} + \
+    && find /opt/mss-login /opt/sam2 /opt/comfyui-manager -type f -exec chmod 0644 {} + \
     && chown root:root \
         /usr/local/bin/entrypoint.sh \
         /usr/local/bin/update.sh \

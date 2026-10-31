@@ -91,6 +91,10 @@ services:
       USE_CPU: ${USE_CPU:-0}
       FORCE_REINSTALL_TORCH: ${FORCE_REINSTALL_TORCH:-0}
       INSTALL_CUSTOM_NODE_DEPS: ${INSTALL_CUSTOM_NODE_DEPS:-true}
+      # Baked ComfyUI-Manager 4.3, MSS-Login owner only and read-only. Install,
+      # update, pip, git-url and snapshot restore answer 403 for everyone.
+      # false starts ComfyUI without Manager.
+      COMFYUI_MANAGER_ENABLED: ${COMFYUI_MANAGER_ENABLED:-true}
     volumes:
       - ${COMFYUI_USER_SCRIPTS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/user-scripts}:/home/comfy/user-scripts:rw
       - ${COMFYUI_MODELS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/models}:/app/ComfyUI/models:rw
