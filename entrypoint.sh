@@ -9,10 +9,38 @@
 # as uid 1000, under image constraints.
 set -euo pipefail
 
-# Bytecode must not be written next to mounted source. This is container-local
-# and is not under custom_nodes, models, or mss-data. Set before any Python.
-# prepare_as_root recreates it mode 0700 and owned by uid 1000. Do not use 1777.
-export PYTHONPYCACHEPREFIX=/tmp/comfy-pycache
+# Root must not honor a caller-supplied PATH or loader variables. A planted
+# .venv/bin/setpriv or LD_LIBRARY_PATH library would otherwise run as root.
+# The venv bin directory is added back only on the setpriv that drops to uid 1000.
+sanitize_root_execution_env() {
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  unset LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT LD_DEBUG LD_PROFILE LD_ORIGIN_PATH \
+    LD_USE_LOAD_BIAS LD_DYNAMIC_WEAK LD_BIND_NOW \
+    PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE PYTHONINSPECT \
+    PYTHONEXECUTABLE PYTHONWARNINGS PYTHONMALLOC PYTHONDEVMODE PYTHONSAFEPATH \
+    PYTHONPLATLIBDIR \
+    BASH_ENV ENV \
+    PERL5OPT PERL5LIB RUBYOPT RUBYLIB NODE_OPTIONS \
+    GCONV_PATH LOCPATH NLSPATH
+}
+
+# Production root always execs /usr/bin/setpriv. The security harness stubs the
+# shell function because a user namespace cannot map uid 1000; honor that stub
+# only when MSS_LOGIN_TEST_MODE=1.
+invoke_setpriv() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" ]] && declare -F setpriv >/dev/null 2>&1; then
+    setpriv "$@"
+    return
+  fi
+  /usr/bin/setpriv "$@"
+}
+
+if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then
+  sanitize_root_execution_env
+else
+  # Bytecode stays off mounted source. Set only for the uid 1000 process.
+  export PYTHONPYCACHEPREFIX=/tmp/comfy-pycache
+fi
 
 comfy_python() {
   if command -v python >/dev/null 2>&1; then
@@ -23,7 +51,7 @@ comfy_python() {
 }
 
 reset_comfy_pycache() {
-  if [[ "$(id -u)" -ne 0 ]]; then
+  if [[ "$(/usr/bin/id -u)" -ne 0 ]]; then
     return 0
   fi
   rm -rf "$PYTHONPYCACHEPREFIX"
@@ -34,7 +62,6 @@ reset_comfy_pycache() {
 
 COMFY_UID=1000
 COMFY_GID=1000
-CLI_ARGS="${CLI_ARGS:---listen 0.0.0.0 --port 9008}"
 DEVICE_TYPE="${DEVICE_TYPE:-auto}"
 USE_CPU="${USE_CPU:-0}"
 FORCE_REINSTALL_TORCH="${FORCE_REINSTALL_TORCH:-0}"
@@ -177,7 +204,7 @@ git_as_comfy() {
   local dir="$1"
   shift
   if [[ "$(id -u)" -eq 0 ]]; then
-    setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- \
+    invoke_setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- \
       git -C "$dir" -c "safe.directory=${dir}" "$@"
     return
   fi
@@ -486,7 +513,7 @@ assert_uid1000_cannot_write() {
   file="$(find "$dest" -type f -print -quit)"
   [[ -n "$file" ]] || return 1
   set +e
-  setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- test -w "$dest"
+  invoke_setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- test -w "$dest"
   rc=$?
   set -e
   if [[ "$rc" -eq 0 ]]; then
@@ -498,7 +525,7 @@ assert_uid1000_cannot_write() {
     return 1
   fi
   set +e
-  setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- test -w "$file"
+  invoke_setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- test -w "$file"
   rc=$?
   set -e
   if [[ "$rc" -eq 0 ]]; then
@@ -878,6 +905,12 @@ if not isinstance(auto_update, dict):
 auto_update["enabled"] = True
 auto_update["mode"] = "notify"
 cfg["auto_update"] = auto_update
+cfg["auto_install_deps"] = False
+experimental = cfg.get("experimental")
+if not isinstance(experimental, dict):
+    experimental = {}
+experimental["install_other_nodes_deps"] = False
+cfg["experimental"] = experimental
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
     json.dump(cfg, handle, indent=4)
@@ -939,34 +972,212 @@ prepend_cuda_library_path() {
 
 # Flags from ComfyUI comfy/cli_args.py at 0dbfd493b4cc604db743c699f0f7ce01348e54a4
 # that change which nodes load or where custom_nodes, models, or user data live.
+# Full names from comfy/cli_args.py at 0dbfd493b4cc604db743c699f0f7ce01348e54a4.
+# argparse accepts an unambiguous prefix, so any --token that is a prefix of
+# one of these (for example --base-dir or --disable-all) is refused too.
+cli_denied_flag_names() {
+  printf '%s\n' \
+    --disable-all-custom-nodes \
+    --whitelist-custom-nodes \
+    --enable-manager \
+    --enable-manager-legacy-ui \
+    --disabled-nodes-config \
+    --disable-partner-nodes \
+    --disable-api-nodes \
+    --offline \
+    --base-directory \
+    --extra-model-paths-config \
+    --output-directory \
+    --temp-directory \
+    --input-directory \
+    --previews-directory \
+    --user-directory \
+    --models-directory
+}
+
 cli_node_path_flag_denied() {
-  case "$1" in
-    --disable-all-custom-nodes|--disable-all-custom-nodes=*|\
-    --whitelist-custom-nodes|--whitelist-custom-nodes=*|\
-    --enable-manager|--enable-manager=*|\
-    --enable-manager-legacy-ui|--enable-manager-legacy-ui=*|\
-    --disabled-nodes-config|--disabled-nodes-config=*|\
-    --disable-partner-nodes|--disable-partner-nodes=*|\
-    --disable-api-nodes|--disable-api-nodes=*|\
-    --offline|--offline=*|\
-    --base-directory|--base-directory=*|\
-    --extra-model-paths-config|--extra-model-paths-config=*|\
-    --output-directory|--output-directory=*|\
-    --temp-directory|--temp-directory=*|\
-    --input-directory|--input-directory=*|\
-    --previews-directory|--previews-directory=*|\
-    --user-directory|--user-directory=*|\
-    --models-directory|--models-directory=*)
+  local token="${1%%=*}" flag
+  [[ "$token" == --* ]] || return 1
+  while IFS= read -r flag; do
+    [[ -n "$flag" ]] || continue
+    if [[ "$flag" == "$token" || "$flag" == "$token"* ]]; then
       return 0
-      ;;
-  esac
+    fi
+  done < <(cli_denied_flag_names)
   return 1
+}
+
+baked_frontend_flag_value() {
+  local version="v1.55.11"
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_FRONTEND_VERSION:-}" ]]; then
+    version="$MSS_FRONTEND_VERSION"
+  elif [[ -f /opt/comfy-frontend/VERSION ]]; then
+    version="$(tr -d '[:space:]' < /opt/comfy-frontend/VERSION)"
+  fi
+  printf '%s\n' "Comfy-Org/ComfyUI_frontend@${version}"
+}
+
+# Drop a user --front-end-version when it matches the baked release, then keep
+# exactly one canonical flag so ComfyUI uses web_custom_versions and does not
+# download. Any other value refuses. Never fetches at runtime.
+normalize_frontend_flag() {
+  local baked token prev="" seen="" value=""
+  local -a args=() kept=()
+  baked="$(baked_frontend_flag_value)"
+  set -f
+  read -r -a args <<< "${CLI_ARGS:-}"
+  set +f
+  for token in "${args[@]}"; do
+    if [[ -n "$prev" ]]; then
+      value="$token"
+      prev=""
+      if [[ "$value" != "$baked" ]]; then
+        refuse_mss_login "Refusing --front-end-version ${value}. The image only serves the baked frontend ${baked} and does not download another."
+      fi
+      seen=1
+      echo "[comfyui-deploy] --front-end-version ${value} matches the baked frontend. No runtime download."
+      continue
+    fi
+    if [[ "$token" == --front-end-version=* || ( "$token" == --*=* && "--front-end-version" == "${token%%=*}"* ) ]]; then
+      value="${token#*=}"
+      if [[ "$value" != "$baked" ]]; then
+        refuse_mss_login "Refusing --front-end-version ${value}. The image only serves the baked frontend ${baked} and does not download another."
+      fi
+      seen=1
+      echo "[comfyui-deploy] --front-end-version ${value} matches the baked frontend. No runtime download."
+      continue
+    fi
+    if [[ "--front-end-version" == "$token" || "--front-end-version" == "$token"* ]]; then
+      prev=1
+      continue
+    fi
+    kept+=("$token")
+  done
+  if [[ -n "$prev" ]]; then
+    refuse_mss_login "Refusing --front-end-version without a value."
+  fi
+  CLI_ARGS=""
+  for token in "${kept[@]}"; do
+    if [[ -z "$CLI_ARGS" ]]; then
+      CLI_ARGS="$token"
+    else
+      CLI_ARGS="${CLI_ARGS} ${token}"
+    fi
+  done
+  if [[ -n "$CLI_ARGS" ]]; then
+    CLI_ARGS="${CLI_ARGS} --front-end-version ${baked}"
+  else
+    CLI_ARGS="--front-end-version ${baked}"
+  fi
+  if [[ -z "$seen" ]]; then
+    echo "[comfyui-deploy] Using baked frontend ${baked}. No runtime download."
+  fi
+  export CLI_ARGS
+}
+
+collapse_ws() {
+  local value="$1"
+  local -a parts=()
+  set -f
+  # shellcheck disable=SC2086
+  read -r -a parts <<< "$value"
+  set +f
+  local IFS=' '
+  printf '%s' "${parts[*]}"
+}
+
+cli_has_flag() {
+  local argline="$1" flag="$2" token
+  local -a arr=()
+  set -f
+  read -r -a arr <<< "$argline"
+  set +f
+  for token in "${arr[@]}"; do
+    [[ "$token" == "$flag" || "$token" == "${flag}="* ]] && return 0
+  done
+  return 1
+}
+
+# Last --port wins, matching argparse. Image defaults are omitted when the
+# user string already contains --listen or --port.
+mss_listen_port() {
+  local argline="${1:-${CLI_ARGS:-}}" token prev="" value=""
+  local -a arr=()
+  set -f
+  read -r -a arr <<< "$argline"
+  set +f
+  for token in "${arr[@]}"; do
+    if [[ "$prev" == "--port" && "$token" != --* ]]; then
+      value="$token"
+    elif [[ "$token" == --port=* ]]; then
+      value="${token#--port=}"
+    fi
+    prev="$token"
+  done
+  if [[ -z "$value" ]]; then
+    value="${COMFYUI_PORT:-9008}"
+  fi
+  printf '%s\n' "$value"
+}
+
+# CLI_ARGS (stack 250) and EXTRA_CLI_ARGS are the same extra argument string.
+# If both are set they must match. Defaults are added only for flags the user
+# did not already pass, so a user --listen/--port is the one that is launched.
+build_cli_args() {
+  local alias_args extra_args user_args listen port cors vram token
+  if [[ -n "${STACK_CLI_ARGS+x}" ]]; then
+    alias_args="${STACK_CLI_ARGS}"
+  else
+    alias_args="${CLI_ARGS-}"
+  fi
+  extra_args="${EXTRA_CLI_ARGS-}"
+  alias_args="$(collapse_ws "$alias_args")"
+  extra_args="$(collapse_ws "$extra_args")"
+  if [[ -n "$alias_args" && -n "$extra_args" && "$alias_args" != "$extra_args" ]]; then
+    refuse_mss_login "CLI_ARGS and EXTRA_CLI_ARGS are both set and differ. Set only one, or set them to the same text."
+  fi
+  if [[ -n "$alias_args" ]]; then
+    user_args="$alias_args"
+  else
+    user_args="$extra_args"
+  fi
+  listen="${COMFYUI_HOST:-0.0.0.0}"
+  port="${COMFYUI_PORT:-9008}"
+  cors="${CORS:-*}"
+  vram="${VRAM_RESERVE_GB:-1.5}"
+  local -a defaults=()
+  cli_has_flag "$user_args" --listen || defaults+=(--listen "$listen")
+  cli_has_flag "$user_args" --port || defaults+=(--port "$port")
+  cli_has_flag "$user_args" --enable-cors-header || defaults+=("--enable-cors-header=${cors}")
+  cli_has_flag "$user_args" --use-pytorch-cross-attention || defaults+=(--use-pytorch-cross-attention)
+  cli_has_flag "$user_args" --reserve-vram || defaults+=(--reserve-vram "$vram")
+  cli_has_flag "$user_args" --disable-smart-memory || defaults+=(--disable-smart-memory)
+  cli_has_flag "$user_args" --cache-lru || defaults+=(--cache-lru 1)
+  CLI_ARGS=""
+  for token in "${defaults[@]}"; do
+    if [[ -z "$CLI_ARGS" ]]; then
+      CLI_ARGS="$token"
+    else
+      CLI_ARGS="${CLI_ARGS} ${token}"
+    fi
+  done
+  if [[ -n "$user_args" ]]; then
+    if [[ -z "$CLI_ARGS" ]]; then
+      CLI_ARGS="$user_args"
+    else
+      CLI_ARGS="${CLI_ARGS} ${user_args}"
+    fi
+  fi
+  export CLI_ARGS
+  normalize_frontend_flag
 }
 
 refuse_cli_node_path_flags() {
   local arg
   local -a args=()
+  set -f
   read -r -a args <<< "${CLI_ARGS:-} $*"
+  set +f
   for arg in "${args[@]}"; do
     if cli_node_path_flag_denied "$arg"; then
       refuse_mss_login "Refusing CLI flag ${arg%%=*}. It changes custom-node loading or a base path. Refused flags: --disable-all-custom-nodes, --whitelist-custom-nodes, --enable-manager, --enable-manager-legacy-ui, --disabled-nodes-config, --disable-partner-nodes, --disable-api-nodes, --offline, --base-directory, --extra-model-paths-config, --output-directory, --temp-directory, --input-directory, --previews-directory, --user-directory, --models-directory."
@@ -1029,31 +1240,36 @@ PY
   fi
 }
 
-mss_login_route_ok() {
-  case "$1" in
-    200|301|302) return 0 ;;
-  esac
-  return 1
+# GET /login must be HTTP 200 and include the MSS-Login page marker.
+# Redirects are not enough: another service could answer 302.
+mss_login_login_body_ok() {
+  local code="$1" body="$2"
+  [[ "$code" == "200" ]] || return 1
+  grep -q 'id="mss-login-auth-app"' "$body"
 }
 
 wait_for_mss_login_route() {
-  local port code n=0
+  local port code n=0 body
   port="${1:-9008}"
-  while [[ "$n" -lt 60 ]]; do
+  body="$(mktemp)"
+  while [[ "$n" -lt 120 ]]; do
     n=$((n + 1))
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/login" || true)"
-    if mss_login_route_ok "$code"; then
-      echo "[comfyui-deploy] MSS-Login GET /login returned ${code}."
+    code="$(curl -s -o "$body" -w '%{http_code}' --max-time 5 "http://127.0.0.1:${port}/login" || true)"
+    if mss_login_login_body_ok "$code" "$body"; then
+      echo "[comfyui-deploy] MSS-Login GET /login returned 200 with the login page."
+      rm -f "$body"
       return 0
     fi
     sleep 5
   done
   echo "[comfyui-deploy] MSS-Login GET /login last status was ${code:-none}." >&2
+  rm -f "$body"
   return 1
 }
 
 launch_comfyui() {
   local detect_line
+  build_cli_args
   echo "[comfyui-deploy] Initializing ComfyUI (${OS} / ${ARCH}, DEVICE_TYPE=${DEVICE_TYPE}, USE_CPU=${USE_CPU})."
 
   require_writable "${MODELS_DIR:-/app/ComfyUI/models}"
@@ -1153,13 +1369,15 @@ PY
 
   cd /app/ComfyUI
   echo "[comfyui-deploy] Launching ComfyUI with args: ${CLI_ARGS} $*"
-  # CLI_ARGS is a space-separated argument string from the compose file.
-  # shellcheck disable=SC2086
-  comfy_python main.py $CLI_ARGS "$@" &
+  local -a comfy_argv=()
+  set -f
+  read -r -a comfy_argv <<< "$CLI_ARGS"
+  set +f
+  comfy_python main.py "${comfy_argv[@]}" "$@" &
   local child=$!
   trap 'kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true' TERM INT
-  if ! wait_for_mss_login_route 9008; then
-    echo "[comfyui-deploy] Stopping. MSS-Login GET /login did not return 200, 301, or 302 within 300s." >&2
+  if ! wait_for_mss_login_route "$(mss_listen_port)"; then
+    echo "[comfyui-deploy] Stopping. MSS-Login GET /login did not return 200 with the login page within 600s." >&2
     kill -TERM "$child" 2>/dev/null || true
     wait "$child" 2>/dev/null || true
     exit 1
@@ -1171,7 +1389,9 @@ main() {
   if [[ "$(id -u)" -eq 0 ]]; then
     prepare_as_root
     cd /app/ComfyUI
-    exec setpriv \
+    exec /usr/bin/env \
+      PATH="/app/ComfyUI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      /usr/bin/setpriv \
       --reuid="${COMFY_UID}" \
       --regid="${COMFY_GID}" \
       --init-groups \

@@ -440,6 +440,10 @@ if auto.get("enabled") is not True or auto.get("mode") != "notify":
     raise SystemExit(f"auto_update was not forced to notify: {auto}")
 if auto.get("check_url") != "https://example.invalid":
     raise SystemExit("check_url was dropped")
+if cfg.get("auto_install_deps") is not False:
+    raise SystemExit("auto_install_deps was not forced off")
+if (cfg.get("experimental") or {}).get("install_other_nodes_deps") is not False:
+    raise SystemExit("install_other_nodes_deps was not forced off")
 PY
   rm -f "$cfg"
   MSS_LOGIN_DATA_DIR="$base" force_mss_login_auto_update_notify >/dev/null
@@ -450,6 +454,11 @@ import sys
 auto = json.load(open(sys.argv[1], encoding="utf-8")).get("auto_update") or {}
 if auto.get("enabled") is not True or auto.get("mode") != "notify":
     raise SystemExit(f"missing config was not created notify: {auto}")
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+if cfg.get("auto_install_deps") is not False:
+    raise SystemExit("auto_install_deps missing")
+if (cfg.get("experimental") or {}).get("install_other_nodes_deps") is not False:
+    raise SystemExit("install_other_nodes_deps missing")
 PY
   rm -rf "$base"
   echo "auto-update notify case passed"
@@ -461,11 +470,17 @@ security_regressions() {
   if grep -n 'chmod 1777' "${root}/entrypoint.sh" >/dev/null; then
     fail "pycache must not be mode 1777"
   fi
-  mss_login_route_ok 200 || fail "200 should pass the login route check"
-  mss_login_route_ok 302 || fail "302 should pass the login route check"
-  if mss_login_route_ok 500; then
-    fail "500 must not pass the login route check"
+  body="$(mktemp)"
+  printf '%s\n' '<div id="mss-login-auth-app"></div>' >"$body"
+  mss_login_login_body_ok 200 "$body" || fail "200 with the login marker should pass"
+  if mss_login_login_body_ok 302 "$body"; then
+    fail "302 must not pass the login check"
   fi
+  printf '%s\n' '<html>other</html>' >"$body"
+  if mss_login_login_body_ok 200 "$body"; then
+    fail "200 without the MSS-Login marker must not pass"
+  fi
+  rm -f "$body"
   (
     export MSS_LOGIN_TEST_MODE=0
     export MSS_LOGIN_DIR=Other
@@ -491,6 +506,23 @@ security_regressions() {
   status=$?
   set -e
   [[ "$status" -ne 0 ]] || fail "whitelist-custom-nodes was allowed"
+  set +e
+  (
+    export CLI_ARGS="--base-dir /tmp/evil"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "--base-dir abbreviation was allowed"
+  set +e
+  (
+    export CLI_ARGS="--disable-all"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "--disable-all abbreviation was allowed"
+  if python3 -c 'import yaml' >/dev/null 2>&1; then
   yaml="$(mktemp)"
   printf '%s\n' 'comfyui:' '  checkpoints: models/checkpoints' >"$yaml"
   MSS_EXTRA_MODEL_PATHS="$yaml" refuse_extra_model_paths_custom_nodes
@@ -512,6 +544,10 @@ security_regressions() {
   status=$?
   set -e
   [[ "$status" -ne 0 ]] || fail "unparseable extra_model_paths was allowed"
+  rm -f "$yaml"
+  else
+    echo "SKIP: PyYAML is missing; extra_model_paths checks were not run"
+  fi
   base="$(new_case)"
   seed="${base}/seed"
   nodes="${base}/custom_nodes"
@@ -561,6 +597,129 @@ PY
   echo "security regressions passed"
 }
 
+# shellcheck disable=SC2030,SC2031
+stack250_cli_case() {
+  local stack250 got
+  stack250='--listen 0.0.0.0 --port 9008 --enable-cors-header=* --use-pytorch-cross-attention --reserve-vram 1.5 --front-end-version Comfy-Org/ComfyUI_frontend@v1.55.11 --disable-smart-memory --cache-lru 1'
+  STACK_CLI_ARGS="$stack250" EXTRA_CLI_ARGS="" build_cli_args >/tmp/stack250-cli.log
+  refuse_cli_node_path_flags
+  assert_eq "$(mss_listen_port)" "9008" "stack 250 port"
+  cli_has_flag "$CLI_ARGS" --listen || fail "listen missing: ${CLI_ARGS}"
+  cli_has_flag "$CLI_ARGS" --port || fail "port missing: ${CLI_ARGS}"
+  cli_has_flag "$CLI_ARGS" --enable-cors-header || fail "cors missing: ${CLI_ARGS}"
+  cli_has_flag "$CLI_ARGS" --use-pytorch-cross-attention || fail "cross-attention missing: ${CLI_ARGS}"
+  cli_has_flag "$CLI_ARGS" --reserve-vram || fail "reserve-vram missing: ${CLI_ARGS}"
+  cli_has_flag "$CLI_ARGS" --disable-smart-memory || fail "disable-smart-memory missing: ${CLI_ARGS}"
+  cli_has_flag "$CLI_ARGS" --cache-lru || fail "cache-lru missing: ${CLI_ARGS}"
+  if [[ "$(grep -o -- '--front-end-version' <<<"$CLI_ARGS" | wc -l | tr -d ' ')" != "1" ]]; then
+    fail "frontend flag should appear once: ${CLI_ARGS}"
+  fi
+  grep -q 'No runtime download' /tmp/stack250-cli.log || fail "baked frontend was not logged"
+  STACK_CLI_ARGS="--listen 127.0.0.1 --port 9010" EXTRA_CLI_ARGS="" build_cli_args
+  assert_eq "$(mss_listen_port)" "9010" "user --port replaces the default"
+  if [[ "$CLI_ARGS" == *"--listen 0.0.0.0"* || "$CLI_ARGS" == *"--port 9008"* ]]; then
+    fail "image listen/port defaults were still passed: ${CLI_ARGS}"
+  fi
+  if [[ "$CLI_ARGS" != *"--front-end-version Comfy-Org/ComfyUI_frontend@v1.55.11"* ]]; then
+    fail "default frontend flag missing: ${CLI_ARGS}"
+  fi
+  local log status
+  log="$(mktemp)"
+  set +e
+  (
+    export STACK_CLI_ARGS="--port 1"
+    export EXTRA_CLI_ARGS="--port 2"
+    build_cli_args
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "differing CLI_ARGS and EXTRA_CLI_ARGS were allowed"
+  grep -q 'both set and differ' "$log" || fail "differ message missing: $(cat "$log")"
+  set +e
+  (
+    export STACK_CLI_ARGS="--port 9010"
+    export EXTRA_CLI_ARGS="--port 9010"
+    build_cli_args
+    [[ "$(mss_listen_port)" == "9010" ]]
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -eq 0 ]] || fail "identical CLI_ARGS and EXTRA_CLI_ARGS were refused: $(cat "$log")"
+  set +e
+  (
+    export STACK_CLI_ARGS="--front-end-version Comfy-Org/ComfyUI_frontend@v9.9.9"
+    export EXTRA_CLI_ARGS=""
+    build_cli_args
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "a non-baked frontend version was allowed"
+  COMFYUI_PORT=9011 STACK_CLI_ARGS="" EXTRA_CLI_ARGS="" build_cli_args >/dev/null
+  assert_eq "$(mss_listen_port)" "9011" "COMFYUI_PORT is the listen port when --port is absent"
+  unset STACK_CLI_ARGS EXTRA_CLI_ARGS COMFYUI_PORT
+  rm -f "$log" /tmp/stack250-cli.log
+  echo "stack 250 cli case passed"
+}
+
+root_loader_env_case() {
+  local base
+  base="$(new_case)"
+  mkdir -p "${base}/venv/bin" "${base}/lib"
+  printf '%s\n' '#!/bin/sh' 'echo planted-setpriv' >"${base}/venv/bin/setpriv"
+  chmod +x "${base}/venv/bin/setpriv"
+  printf 'planted\n' >"${base}/lib/libevil.so"
+  (
+    export PATH="${base}/venv/bin:${PATH}"
+    export LD_LIBRARY_PATH="${base}/lib"
+    sanitize_root_execution_env
+    [[ "$(command -v setpriv)" == "/usr/bin/setpriv" ]] || exit 1
+    [[ -z "${LD_LIBRARY_PATH:-}" ]] || exit 2
+    [[ -z "${LD_PRELOAD:-}" && -z "${PYTHONPATH:-}" && -z "${BASH_ENV:-}" ]] || exit 3
+  ) || fail "root still honored a planted PATH or loader variable"
+  if grep -n 'exec setpriv ' "${root}/entrypoint.sh" >/dev/null; then
+    fail "entrypoint still execs setpriv from PATH"
+  fi
+  grep -q '/usr/bin/setpriv' "${root}/entrypoint.sh" || fail "setpriv is not absolute"
+  rm -rf "$base"
+  echo "root loader env case passed"
+}
+
+install_noop_case() {
+  local dest
+  [[ -d /tmp/mssl2/.git ]] || fail "pinned checkout /tmp/mssl2 is required for the install no-op test"
+  dest="$(mktemp -d)"
+  git clone --quiet /tmp/mssl2 "$dest"
+  git -C "$dest" apply "${root}/patches/mss-login-no-inplace-update.patch"
+  python3 - "$dest" <<'PY'
+import importlib.util
+import subprocess
+import sys
+
+calls = []
+
+def boom(*args, **kwargs):
+    calls.append(args)
+    raise AssertionError("subprocess.run was called")
+
+subprocess.run = boom
+path = sys.argv[1] + "/utils/install_deps.py"
+spec = importlib.util.spec_from_file_location("install_deps_patched", path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+if mod.install_dependencies() is not True or calls:
+    raise SystemExit(f"install_dependencies was not a no-op: {calls}")
+init = open(sys.argv[1] + "/__init__.py", encoding="utf-8").read()
+for line in init.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        continue
+    if "install_dependencies()" in stripped:
+        raise SystemExit("__init__.py still calls install_dependencies()")
+PY
+  rm -rf "$dest"
+  echo "install no-op case passed"
+}
+
 filter_case
 cache_case
 shadow_case
@@ -571,4 +730,7 @@ remote_and_hash_case
 break_glass_case
 auto_update_off_case
 security_regressions
+stack250_cli_case
+root_loader_env_case
+install_noop_case
 echo "all runtime guard tests passed"

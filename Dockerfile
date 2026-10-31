@@ -85,6 +85,7 @@ COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=755 update.sh /usr/local/bin/update.sh
 COPY --chmod=755 scripts/write-torch-constraints.sh /usr/local/bin/write-torch-constraints.sh
 COPY --chmod=755 scripts/write-mss-login-manifest.sh /usr/local/bin/write-mss-login-manifest.sh
+COPY --chmod=755 scripts/mss-login-healthcheck /usr/local/bin/mss-login-healthcheck
 COPY patches/mss-login-no-inplace-update.patch /opt/mss-login/patches/mss-login-no-inplace-update.patch
 COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
 
@@ -93,6 +94,13 @@ COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allow
 # --require-hashes. Impact-Pack's git+ line is dropped at runtime.
 ARG SAM2_REPO=https://github.com/facebookresearch/sam2.git
 ARG SAM2_REF=2b90b9f5ceec907a1c18123530e92e794ad901a4
+# ComfyUI app/frontend_management.py (0dbfd493) uses
+# web_custom_versions/<owner>_<repo>/<version without v> and skips the GitHub
+# download when that directory already exists.
+ARG COMFYUI_FRONTEND_VERSION=v1.55.11
+ARG COMFYUI_FRONTEND_SHA256=37fac946be14a9cd96ec3fc0dd92fca826c24093c11e1e7184262f8a187f1071
+ARG DOTENVX_VERSION=v2.38.2
+ARG DOTENVX_SHA256=18196e97e94124de756cc728a1472bc242c81d9760733880522471f81484454e
 
 RUN mkdir -p \
         /data/mss-login \
@@ -101,6 +109,25 @@ RUN mkdir -p \
         /app/ComfyUI/models \
         /app/ComfyUI/output \
         /app/ComfyUI/user \
+        /app/ComfyUI/temp \
+        /opt/comfy-frontend \
+    && curl -fsSL -o /tmp/frontend-dist.zip \
+        "https://github.com/Comfy-Org/ComfyUI_frontend/releases/download/${COMFYUI_FRONTEND_VERSION}/dist.zip" \
+    && echo "${COMFYUI_FRONTEND_SHA256}  /tmp/frontend-dist.zip" | sha256sum -c - \
+    && frontend_dir="/app/ComfyUI/web_custom_versions/Comfy-Org_ComfyUI_frontend/${COMFYUI_FRONTEND_VERSION#v}" \
+    && mkdir -p "${frontend_dir}" \
+    && /app/ComfyUI/.venv/bin/python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' /tmp/frontend-dist.zip "${frontend_dir}" \
+    && rm -f /tmp/frontend-dist.zip \
+    && printf '%s\n' "${COMFYUI_FRONTEND_VERSION}" > /opt/comfy-frontend/VERSION \
+    && printf '%s\n' "${COMFYUI_FRONTEND_SHA256}" > /opt/comfy-frontend/SHA256 \
+    && curl -fsSL -o /tmp/dotenvx.tar.gz \
+        "https://github.com/dotenvx/dotenvx/releases/download/${DOTENVX_VERSION}/dotenvx-${DOTENVX_VERSION#v}-linux-x86_64.tar.gz" \
+    && echo "${DOTENVX_SHA256}  /tmp/dotenvx.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/dotenvx.tar.gz -C /tmp \
+    && mv /tmp/dotenvx /usr/local/bin/dotenvx \
+    && rm -f /tmp/dotenvx.tar.gz \
+    && chown root:root /usr/local/bin/dotenvx \
+    && chmod 755 /usr/local/bin/dotenvx \
     && (getent group comfy >/dev/null || groupadd --gid 1000 comfy) \
     && (id -u comfy >/dev/null 2>&1 || useradd --uid 1000 --gid 1000 --create-home --home-dir /home/comfy --shell /bin/bash comfy) \
     && (getent group render >/dev/null || groupadd --system render) \
@@ -159,6 +186,11 @@ RUN mkdir -p \
          "iopath==0.1.10" \
     && rm -rf /tmp/uv-cache \
     && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/uv-python /opt/uv-tools /opt/comfy-constraints \
+    && chown root:root /app /app/ComfyUI \
+    && chmod 755 /app /app/ComfyUI \
+    && chown -R root:root /app/ComfyUI/web_custom_versions /opt/comfy-frontend \
+    && find /app/ComfyUI/web_custom_versions /opt/comfy-frontend -type d -exec chmod 755 {} + \
+    && find /app/ComfyUI/web_custom_versions /opt/comfy-frontend -type f -exec chmod 644 {} + \
     && chown -R root:root /opt/mss-login /opt/sam2 \
     && find /opt/mss-login /opt/sam2 -type d -exec chmod 0755 {} + \
     && find /opt/mss-login /opt/sam2 -type f -exec chmod 0644 {} + \
@@ -167,11 +199,13 @@ RUN mkdir -p \
         /usr/local/bin/update.sh \
         /usr/local/bin/write-torch-constraints.sh \
         /usr/local/bin/write-mss-login-manifest.sh \
+        /usr/local/bin/mss-login-healthcheck \
     && chmod 755 \
         /usr/local/bin/entrypoint.sh \
         /usr/local/bin/update.sh \
         /usr/local/bin/write-torch-constraints.sh \
-        /usr/local/bin/write-mss-login-manifest.sh
+        /usr/local/bin/write-mss-login-manifest.sh \
+        /usr/local/bin/mss-login-healthcheck
 # Root does not source /home/comfy/.bashrc or /etc/profile.d. No sitecustomize
 # is installed. The venv is uid 1000, including any .pth a later pip install
 # writes; startup python passes --check-hash-based-pycs always and the config
@@ -186,8 +220,8 @@ USER comfy
 WORKDIR /app/ComfyUI
 EXPOSE 9008
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=300s \
-    CMD ["curl", "-f", "http://127.0.0.1:9008/login"]
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=600s \
+    CMD ["/usr/local/bin/mss-login-healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
@@ -216,10 +250,11 @@ ARG CUDA_VERSION=cu130
 # sam2 is already installed in the base stage from commit
 # 2b90b9f5ceec907a1c18123530e92e794ad901a4 (wheel sha256 recorded at
 # /opt/sam2/SHA256). This stage does not reinstall it.
+# LD_LIBRARY_PATH is not set in this image. Root unsets it. uid 1000 sets it
+# from the venv after setpriv.
 ENV DEVICE_TYPE=cuda \
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    LD_LIBRARY_PATH=/app/ComfyUI/.venv/lib/python3.13/site-packages/torch/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cusparselt/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/nvshmem/lib
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 RUN case "${CUDA_VERSION}" in \
       cu128|cu130) ;; \
       *) echo "CUDA_VERSION must be cu128 or cu130" >&2; exit 1 ;; \

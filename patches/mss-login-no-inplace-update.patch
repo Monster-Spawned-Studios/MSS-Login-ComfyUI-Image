@@ -1,3 +1,23 @@
+diff --git a/__init__.py b/__init__.py
+index 93324bb..2b19df3 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,13 +1,6 @@
+ # --- START OF FILE __init__.py ---
+-# Auto-install dependencies before any package imports
+-try:
+-	from .utils.install_deps import install_dependencies
+-
+-	install_dependencies()
+-except Exception as e:
+-	import sys
+-
+-	print(f"[mss-login] Auto-dependency installation failed: {e}", file=sys.stderr)
++# Dependency installs run at image build under the torch constraints.
++# install_dependencies() is intentionally not called here.
+ 
+ import asyncio
+ import json
 diff --git a/routes/admin.py b/routes/admin.py
 index 32e45bd..80323d7 100644
 --- a/routes/admin.py
@@ -42,6 +62,65 @@ index 32e45bd..80323d7 100644
  
  
  routes.post("/api/mss-login/api/update-apply")(api_update_apply)
+diff --git a/utils/install_deps.py b/utils/install_deps.py
+index 12bf544..6af4841 100644
+--- a/utils/install_deps.py
++++ b/utils/install_deps.py
+@@ -464,52 +464,8 @@ def _ensure_dotenvx_binary() -> bool:
+ 
+ 
+ def install_dependencies() -> bool:
+-	"""UV-first dependency install into ComfyUI's Python. Safe at module load."""
+-	global _install_attempted
+-
+-	if _install_attempted:
+-		if DEBUG_MODE:
+-			_log("[mss-login] Dependency install already attempted this process; skipping.")
+-		return True
+-
+-	_install_attempted = True
+-	root = _install_deps_root
+-	plan = detect_torch_install_plan()
+-	_log(
+-		f"[mss-login] PyTorch install plan: backend={plan.get('backend')} "
+-		f"index={plan.get('extra_index_url') or 'PyPI (Metal/default)'}"
+-	)
+-	req_rel = _platform_requirements_rel()
+-
+-	try:
+-		if _install_with_uv(root, req_rel):
+-			deps_ok = True
+-		elif _install_with_pip(root, req_rel):
+-			_log("[mss-login] Dependencies installed via pip fallback.")
+-			deps_ok = True
+-		else:
+-			_log(
+-				"[mss-login] Dependency install failed (uv and pip). "
+-				"Install manually: uv pip install . or pip install -r requirements.txt",
+-				error=True,
+-			)
+-			deps_ok = False
+-	except Exception as exc:
+-		_log(f"[mss-login] Python dependency installation failed: {exc}", error=True)
+-		deps_ok = False
+-
+-	# dotenvx binary is optional; do not fail the whole install if postinstall fails
+-	try:
+-		if not _ensure_dotenvx_binary():
+-			_log(
+-				"[mss-login] Dotenvx binary unavailable. "
+-				"Install python-dotenvx and run dotenvx-postinstall if needed.",
+-				error=True,
+-			)
+-	except Exception as exc:
+-		_log(f"[mss-login] Dotenvx setup failed: {exc}", error=True)
+-
+-	return deps_ok
++	"""No-op in this image. Dependencies and dotenvx are installed at build."""
++	return True
+ 
+ 
+ # --- END OF FILE utils/install_deps.py ---
 diff --git a/utils/updater.py b/utils/updater.py
 index 39d907e..408f727 100644
 --- a/utils/updater.py

@@ -42,7 +42,7 @@ docker build --target nvidia \
 - The host `custom_nodes/MSS-Login` checkout is not loaded. A tmpfs is mounted on that folder. Root copies the baked tree onto it, locks it `root:root` (`0755` directories, `0644` files), checks the manifest, and only then drops to uid 1000.
 - NVIDIA stage also installs `onnxruntime-gpu==1.31.1` (CUDA 13 wheels), `insightface==2.1`, `onnx==1.23.2`, `gguf==0.19.0`, and `opencv-python-headless==5.0.0.93`, constrained to the baked torch/CUDA pins.
 - sam2 is baked from `https://github.com/facebookresearch/sam2` commit `2b90b9f5ceec907a1c18123530e92e794ad901a4`. The image builds a wheel with `SAM2_BUILD_CUDA=0`, records its sha256 in `/opt/sam2/SHA256`, and installs that wheel with `--require-hashes --no-deps`. `hydra-core==1.3.8` and `iopath==0.1.10` are installed with it. Impact-Pack's `git+https://github.com/facebookresearch/sam2` line is skipped at runtime and the log names the node and the line.
-- The container starts as root (`user: "0:0"`) so the entrypoint can `chown` root-owned volume data to uid 1000 and seed the shadow, then drops privileges with `setpriv`. The shadow stays root-owned. A directory whose top-level owner is already 1000 is not walked again.
+- The container starts as root (`user: "0:0"`). The entrypoint immediately sets `PATH` to the system directories and unsets `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONUSERBASE`, `BASH_ENV`, and `ENV`. `setpriv` is `/usr/bin/setpriv`. The venv `bin` directory and the cuDNN `LD_LIBRARY_PATH` are added only for the uid 1000 process. A stack `LD_LIBRARY_PATH` is ignored by root. `dotenvx` `v2.38.2` is at `/usr/local/bin/dotenvx` (tarball sha256 `18196e97e94124de756cc728a1472bc242c81d9760733880522471f81484454e`). MSS-Login's `install_dependencies()` is a no-op in the image patch, and `auto_install_deps` plus `experimental.install_other_nodes_deps` are forced off.
 
 ## Portainer
 
@@ -74,7 +74,7 @@ The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/RE
 
 `portainer-stack.yml` mounts a tmpfs at `/app/ComfyUI/custom_nodes/MSS-Login` (`uid=0`, `gid=0`, `mode=0755`, `noexec`, `nosuid`, no size cap). That folder name is fixed. `MSS_LOGIN_DIR` is not a stack variable; only `MSS_LOGIN_TEST_MODE=1` may point tests at another name. The host directory of the same name, including its `.venv` and `__pycache__`, stays on the host and is not read. Startup refuses unless `/proc/self/mountinfo` shows that exact path as fstype `tmpfs` and the directory is empty before the copy. Root then copies the baked tree, sets `root:root` with mode `0755` on directories and `0644` on files, and checks the shadow against the baked file hashes, the non-directory list, and the directory list. The check finishes before `setpriv`. A remount read-only is attempted. If the remount is not permitted, root ownership and those modes are the write barrier: uid 1000 cannot modify the tree.
 
-Startup refuses `EXTRA_CLI_ARGS` (or any other `CLI_ARGS` token) that changes node loading or a base path. From `comfy/cli_args.py` at `0dbfd493b4cc604db743c699f0f7ce01348e54a4`, the refused flags are `--disable-all-custom-nodes`, `--whitelist-custom-nodes`, `--enable-manager`, `--enable-manager-legacy-ui`, `--disabled-nodes-config`, `--disable-partner-nodes`, `--disable-api-nodes`, `--offline`, `--base-directory`, `--extra-model-paths-config`, `--output-directory`, `--temp-directory`, `--input-directory`, `--previews-directory`, `--user-directory`, and `--models-directory`. `extra_model_paths.yaml` is parsed with PyYAML and refused when it contains a `custom_nodes` key or cannot be parsed. After ComfyUI starts, the entrypoint requires `GET /login` to return 200, 301, or 302 within 300 seconds and stops the process if it does not.
+Startup refuses `CLI_ARGS` and `EXTRA_CLI_ARGS` tokens that change node loading or a base path. From `comfy/cli_args.py` at `0dbfd493b4cc604db743c699f0f7ce01348e54a4`, the refused flags are `--disable-all-custom-nodes`, `--whitelist-custom-nodes`, `--enable-manager`, `--enable-manager-legacy-ui`, `--disabled-nodes-config`, `--disable-partner-nodes`, `--disable-api-nodes`, `--offline`, `--base-directory`, `--extra-model-paths-config`, `--output-directory`, `--temp-directory`, `--input-directory`, `--previews-directory`, `--user-directory`, and `--models-directory`. `--front-end-version`, `--listen`, `--port`, `--enable-cors-header`, `--use-pytorch-cross-attention`, `--reserve-vram`, `--disable-smart-memory`, and `--cache-lru` are not refused. `extra_model_paths.yaml` is parsed with PyYAML and refused when it contains a `custom_nodes` key or cannot be parsed. After ComfyUI starts, the entrypoint requires `GET /login` to return 200, 301, or 302 within 600 seconds and stops the process if it does not. The Docker healthcheck uses the same 600 second `start_period` because the first boot still checks Impact, RMBG, and controlnet_aux model files before the login route answers.
 
 Python bytecode is written only under `PYTHONPYCACHEPREFIX=/tmp/comfy-pycache`. On startup, root deletes that directory and recreates it mode `0700` owned by uid 1000. Every `python` launch from the entrypoint and `update.sh` passes `--check-hash-based-pycs always`. The host `__pycache__` is under the covered mount, so it is not on the import path. Git metadata inside other custom nodes is read as uid 1000 with `safe.directory` set to that directory only.
 
@@ -111,6 +111,17 @@ Pinned `1d9acbcee661088145e0adb38ab1dc829393108f` stores update behavior in the 
 `POST /mss-login/api/update-apply` ignores `auto_update` and would otherwise call `perform_update` (git pull plus pip). The image applies `patches/mss-login-no-inplace-update.patch` with `git apply --check` and then `git apply` before it writes the manifest. The build fails if that patch does not apply. `/opt/mss-login/PATCHES` records the patch name, and `/opt/mss-login/REVISION` stays the pinned commit. The patched route returns HTTP 403 and `Updates are applied by rebuilding the image with a new MSS_LOGIN_REF`. `perform_update` and `perform_recovery_update` return that same error and do not run git or pip. The Update now button is created in JavaScript (`web/js/auth.js` and `web/js/loading.js`), not a one-line template, so the button can still appear in notify mode. The API refuses it.
 
 `utils/updater.py` line 533 writes `.last_update_check` into the plugin tree and ignores the error. In notify mode that write can be reached. Failure on the read-only shadow is expected.
+
+## ComfyUI frontend
+
+`--front-end-version Comfy-Org/ComfyUI_frontend@v1.55.11` is the stack 250 value. ComfyUI's `app/frontend_management.py` `init_frontend_unsafe` at commit `0dbfd493b4cc604db743c699f0f7ce01348e54a4` looks for `web_custom_versions/Comfy-Org_ComfyUI_frontend/1.55.11` under the ComfyUI root (`Path(__file__).parents[1]`, lines 390–400). If that directory exists it does not download. The image extracts the release asset `dist.zip` there after checking sha256 `37fac946be14a9cd96ec3fc0dd92fca826c24093c11e1e7184262f8a187f1071`, then makes `/app/ComfyUI` and that tree root:root mode `0755`/`0644`. uid 1000 cannot replace it, and startup does not need GitHub.
+
+To bump it, change both Dockerfile `ARG`s and rebuild:
+
+- `COMFYUI_FRONTEND_VERSION` (default `v1.55.11`, the tag on `https://github.com/Comfy-Org/ComfyUI_frontend/releases`)
+- `COMFYUI_FRONTEND_SHA256` (`sha256sum` of that tag's `dist.zip`)
+
+The directory name drops the leading `v`. Set stack `FRONTEND_VERSION` to the same tag. `CLI_ARGS` and `EXTRA_CLI_ARGS` are one extra argument string. If both are non-empty and not the same text, startup refuses. A `--listen` or `--port` in that string is the one that is launched; the image default is not also passed. Other repeated flags follow argparse, which keeps the last value. The healthcheck (`/usr/local/bin/mss-login-healthcheck`) reads that same assembly and curls `127.0.0.1` on the resulting port.
 
 ## Updating MSS-Login
 
@@ -176,8 +187,9 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `COMFYUI_INSIGHTFACE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface` | existing host directory, mounted read-only at `/app/ComfyUI/models/insightface` |
 | `CORS` | `*` | inside `CLI_ARGS` |
 | `VRAM_RESERVE_GB` | `1.5` | inside `CLI_ARGS` (`--reserve-vram`) |
-| `FRONTEND_VERSION` | `latest` | inside `CLI_ARGS` (`--front-end-version`) |
-| `EXTRA_CLI_ARGS` | empty | appended to `CLI_ARGS` |
+| `FRONTEND_VERSION` | `v1.55.11` | `--front-end-version Comfy-Org/ComfyUI_frontend@<version>` when that flag is absent |
+| `CLI_ARGS` | empty | `STACK_CLI_ARGS`. Alias of `EXTRA_CLI_ARGS` (stack 250). Both set and different refuses to start |
+| `EXTRA_CLI_ARGS` | empty | `EXTRA_CLI_ARGS` |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | `PYTORCH_CUDA_ALLOC_CONF` |
 | `TZ` | `America/Boise` | `TZ` and `TIME_ZONE` |
 | `CIVITAI_TOKEN` | empty | `CIVITAI_TOKEN` |
@@ -219,7 +231,6 @@ Set in the container and not read from the stack environment:
 | `MODELS_DIR` | `/app/ComfyUI/models` |
 | `NODES_DIR` | `/app/ComfyUI/custom_nodes` |
 | `COMFYUI_CUSTOM_NODES_DIR` | `/app/ComfyUI/custom_nodes` |
-| `CLI_ARGS` | assembled from the listen, port, CORS, cross-attention, reserve-vram, frontend, `--disable-smart-memory`, and `--cache-lru 1` flags |
 | `LD_LIBRARY_PATH` | venv `torch/lib` and `nvidia/{cu13,cudnn,cusparselt,nccl,nvshmem}/lib` |
 | `HF_HOME` | `/home/comfy/.cache/huggingface` |
 | `HUGGINGFACE_HUB_CACHE` | `/home/comfy/.cache/huggingface/hub` |

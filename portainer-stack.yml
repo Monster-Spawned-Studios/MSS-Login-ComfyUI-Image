@@ -48,16 +48,16 @@ services:
       MODELS_DIR: /app/ComfyUI/models
       NODES_DIR: /app/ComfyUI/custom_nodes
       COMFYUI_CUSTOM_NODES_DIR: /app/ComfyUI/custom_nodes
-      CLI_ARGS: >-
-        --listen ${COMFYUI_HOST:-0.0.0.0}
-        --port ${COMFYUI_PORT:-9008}
-        --enable-cors-header=${CORS:-*}
-        --use-pytorch-cross-attention
-        --reserve-vram ${VRAM_RESERVE_GB:-1.5}
-        --front-end-version Comfy-Org/ComfyUI_frontend@${FRONTEND_VERSION:-latest}
-        --disable-smart-memory
-        --cache-lru 1
-        ${EXTRA_CLI_ARGS:-}
+      # The entrypoint builds the process argv. CLI_ARGS (stack 250) and
+      # EXTRA_CLI_ARGS are the same extra string; both set and different refuses.
+      # Defaults omit --listen and --port when that string already has them.
+      COMFYUI_HOST: ${COMFYUI_HOST:-0.0.0.0}
+      COMFYUI_PORT: ${COMFYUI_PORT:-9008}
+      CORS: ${CORS:-*}
+      VRAM_RESERVE_GB: ${VRAM_RESERVE_GB:-1.5}
+      FRONTEND_VERSION: ${FRONTEND_VERSION:-v1.55.11}
+      STACK_CLI_ARGS: ${CLI_ARGS:-}
+      EXTRA_CLI_ARGS: ${EXTRA_CLI_ARGS:-}
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       TZ: ${TZ:-America/Boise}
       TIME_ZONE: ${TZ:-America/Boise}
@@ -76,9 +76,8 @@ services:
       POSTGRES_USER: ${POST_USER:-}
       POSTGRES_PASSWORD: ${POST_PASS:-}
       COMFYUI_COPILOT_PREFER_OPENAI_AGENTS: ${PREFER_OPENAI_AGENTS:-1}
-      # cuDNN 9 from the venv, ahead of any system library. Same set as the
-      # nvidia image ENV, rewritten for /app/ComfyUI/.venv.
-      LD_LIBRARY_PATH: /app/ComfyUI/.venv/lib/python3.13/site-packages/torch/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cusparselt/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/nvshmem/lib
+      # LD_LIBRARY_PATH is not set in the stack. Root unsets it. After setpriv,
+      # the entrypoint points uid 1000 at the venv CUDA/cuDNN libraries.
       HF_HOME: /home/comfy/.cache/huggingface
       HUGGINGFACE_HUB_CACHE: /home/comfy/.cache/huggingface/hub
       TORCH_HOME: /home/comfy/.cache/torch
@@ -121,11 +120,11 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=${AUTO_UPDATE:-false}"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:${COMFYUI_PORT:-9008}/login"]
+      test: ["CMD", "/usr/local/bin/mss-login-healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 300s
+      start_period: 600s
     deploy:
       resources:
         limits:

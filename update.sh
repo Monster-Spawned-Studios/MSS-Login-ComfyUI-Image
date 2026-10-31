@@ -7,11 +7,16 @@
 # container already seeded it, and an empty-tmpfs check would refuse here.
 set -euo pipefail
 
-if [[ "$(id -u)" -eq 0 ]]; then
+if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  unset LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP \
+    PYTHONUSERBASE BASH_ENV ENV
   export HOME="${HOME:-/home/comfy}"
   export USER=comfy
   export LOGNAME=comfy
-  exec setpriv --reuid=1000 --regid=1000 --init-groups --inh-caps=-all -- "$0" "$@"
+  exec /usr/bin/env \
+    PATH="/app/ComfyUI/.venv/bin:${PATH}" \
+    /usr/bin/setpriv --reuid=1000 --regid=1000 --init-groups --inh-caps=-all -- "$0" "$@"
 fi
 
 ARCH="$(uname -m)"

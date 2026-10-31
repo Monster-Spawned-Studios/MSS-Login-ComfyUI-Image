@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Docker healthcheck. Uses the same CLI assembly as the entrypoint so the
+# port is COMFYUI_PORT, or --port from CLI_ARGS/EXTRA_CLI_ARGS, else 9008.
+set -euo pipefail
+# shellcheck source=entrypoint.sh
+source /usr/local/bin/entrypoint.sh
+build_cli_args
+port="$(mss_listen_port)"
+body="$(mktemp)"
+code="$(curl -s -o "$body" -w '%{http_code}' --max-time 10 "http://127.0.0.1:${port}/login" || true)"
+if mss_login_login_body_ok "$code" "$body"; then
+  rm -f "$body"
+  exit 0
+fi
+rm -f "$body"
+exit 1
