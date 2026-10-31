@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Container entrypoint.
-# Starts as root only long enough to give uid 1000 ownership of root-owned
-# volume data, then drops privileges. A host MSS-Login tree is accepted only
-# when its files match the image copy and its git checkout is the baked
-# revision with a clean status. Custom-node requirements are installed only
-# for names in the baked allowlist, as uid 1000, under image constraints.
+# Starts as root only long enough to chown root-owned volume data to uid 1000
+# and to seed the MSS-Login shadow. The host custom_nodes/MSS-Login checkout
+# is never read, imported, or modified. ComfyUI loads the folder named by
+# MSS_LOGIN_DIR only when that path is a tmpfs; root copies the baked tree
+# onto it, locks it root:root, and checks the baked manifest before setpriv.
+# Custom-node requirements are installed only for names in the baked allowlist,
+# as uid 1000, under image constraints.
 set -euo pipefail
 
 # Bytecode must not be written next to mounted source. This is container-local
@@ -117,14 +119,14 @@ ensure_owned() {
   chown -R "${COMFY_UID}:${COMFY_GID}" "$path"
 }
 
-# Package name or the plugin entry module. Folder name is not consulted.
+# Package name or the plugin entry module, read only from this directory root.
 is_mss_login_tree() {
   local dir="$1"
-  [[ -e "$dir" ]] || return 1
-  if [[ -f "${dir}/pyproject.toml" ]] && grep -E -q '^[[:space:]]*name[[:space:]]*=[[:space:]]*["'\'']MSS-Login["'\''][[:space:]]*$' "${dir}/pyproject.toml"; then
+  [[ -d "$dir" ]] || return 1
+  if [[ -f "${dir}/pyproject.toml" && ! -L "${dir}/pyproject.toml" ]] && grep -E -q '^[[:space:]]*name[[:space:]]*=[[:space:]]*["'\'']MSS-Login["'\''][[:space:]]*$' "${dir}/pyproject.toml"; then
     return 0
   fi
-  if [[ -f "${dir}/mss_login.py" ]] && grep -q 'create_mss_login_middleware' "${dir}/mss_login.py"; then
+  if [[ -f "${dir}/mss_login.py" && ! -L "${dir}/mss_login.py" ]] && grep -q 'create_mss_login_middleware' "${dir}/mss_login.py"; then
     return 0
   fi
   return 1
@@ -132,24 +134,30 @@ is_mss_login_tree() {
 
 declare -gA MSS_FP_HASHES=()
 
-load_mss_login_fingerprints() {
-  local root file hash
+# Hashes of regular files that sit in the baked package root. Nested trees
+# such as .venv or node_modules are not fingerprints: ComfyUI does not import
+# those as separate custom nodes.
+load_root_fingerprints() {
+  local root file base hash
   MSS_FP_HASHES=()
   root="$(mss_login_baked_root)"
   [[ -d "$root" ]] || return 0
-  while IFS= read -r file; do
+  shopt -s nullglob
+  for file in "${root}"/*; do
     [[ -f "$file" && ! -L "$file" ]] || continue
-    hash="$(sha256sum "$file" | awk '{print $1}')"
-    MSS_FP_HASHES["$hash"]=1
-  done < <(find -P "$root" \
-    \( -name .git -o -name __pycache__ -o -name docs -o -name readme -o -name .github \) -prune -o \
-    -type f ! -name '*.pyc' ! -name 'README*' ! -name 'LICENSE*' -size +0c -print)
+    base="$(basename "$file")"
+    [[ "$base" == README* || "$base" == LICENSE* ]] && continue
+    [[ -s "$file" ]] || continue
+    hash="$(sha256sum -- "$file" | awk '{print $1}')"
+    MSS_FP_HASHES["$hash"]="$base"
+  done
+  shopt -u nullglob
 }
 
 git_remote_matches_mss_login() {
   local dir="$1"
   local canon top url
-  [[ -e "$dir" ]] || return 1
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
   canon="$(realpath "$dir")"
   top="$(git -C "$canon" -c safe.directory="$canon" rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$top" ]] || return 1
@@ -159,151 +167,68 @@ git_remote_matches_mss_login() {
   [[ "$url" == *ComfyUI-MSS-Login* || "$url" == *"/MSS-Login"* || "$url" == *":MSS-Login"* ]]
 }
 
-dir_has_baked_file() {
-  local dir="$1"
-  local file hash
-  [[ -d "$dir" ]] || return 1
-  [[ "${#MSS_FP_HASHES[@]}" -gt 0 ]] || return 1
-  while IFS= read -r file; do
-    [[ -f "$file" && ! -L "$file" ]] || continue
-    hash="$(sha256sum "$file" | awk '{print $1}')"
-    if [[ -n "${MSS_FP_HASHES[$hash]:-}" ]]; then
-      return 0
-    fi
-  done < <(find -P "$dir" \( -name .git -o -name __pycache__ \) -prune -o -type f ! -name '*.pyc' -print)
-  return 1
+# ComfyUI nodes.py init_external_custom_nodes at
+# 0dbfd493b4cc604db743c699f0f7ce01348e54a4, lines 2371-2380.
+# https://github.com/comfyanonymous/ComfyUI/blob/0dbfd493b4cc604db743c699f0f7ce01348e54a4/nodes.py
+# The image installs ComfyUI with --version latest, so this is the loader
+# that was matched, not a pin of the installed tree. It skips __pycache__,
+# non-.py files, and paths ending in .disabled. Hidden directories are not skipped.
+loader_would_import() {
+  local path="$1"
+  local name
+  name="$(basename "$path")"
+  [[ "$name" == "__pycache__" ]] && return 1
+  [[ "$path" == *.disabled ]] && return 1
+  if [[ -f "$path" ]]; then
+    [[ "${path##*.}" == "py" ]] || return 1
+  fi
+  [[ -e "$path" || -L "$path" ]]
 }
 
-dir_has_mss_login_signal() {
-  local dir="$1"
-  local target="$dir"
-  if [[ -L "$dir" ]]; then
-    target="$(realpath "$dir" 2>/dev/null || true)"
+# Markers and hashes at the entry root only. Does not walk .venv, node_modules,
+# or __pycache__ inside the candidate.
+entry_has_mss_login_signal() {
+  local path="$1"
+  local target file base hash
+  if [[ -L "$path" ]]; then
+    target="$(realpath "$path" 2>/dev/null || true)"
     [[ -n "$target" ]] || return 1
+  else
+    target="$path"
   fi
+  if [[ -f "$target" && ! -L "$target" ]]; then
+    hash="$(sha256sum -- "$target" | awk '{print $1}')"
+    [[ -n "${MSS_FP_HASHES[$hash]:-}" ]] && return 0
+    grep -q 'create_mss_login_middleware' "$target"
+    return
+  fi
+  [[ -d "$target" ]] || return 1
   if is_mss_login_tree "$target"; then
     return 0
   fi
   if git_remote_matches_mss_login "$target"; then
     return 0
   fi
-  if dir_has_baked_file "$target"; then
-    return 0
-  fi
-  return 1
-}
-
-discover_mss_login_dirs() {
-  local nodes_root="$1"
-  local dir name
-  [[ -d "$nodes_root" ]] || return 0
   shopt -s nullglob
-  for dir in "${nodes_root}"/*; do
-    [[ -d "$dir" ]] || continue
-    name="$(basename "$dir")"
-    [[ "$name" == .* ]] && continue
-    if dir_has_mss_login_signal "$dir"; then
-      printf '%s\n' "$dir"
+  for file in "${target}"/*; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    base="$(basename "$file")"
+    [[ "$base" == README* || "$base" == LICENSE* ]] && continue
+    hash="$(sha256sum -- "$file" | awk '{print $1}')"
+    if [[ -n "${MSS_FP_HASHES[$hash]:-}" ]]; then
+      shopt -u nullglob
+      return 0
     fi
   done
   shopt -u nullglob
-}
-
-log_mss_login_remote() {
-  local dir="$1"
-  local canon url
-  canon="$(realpath "$dir")"
-  url="$(git -C "$canon" -c safe.directory="$canon" remote get-url origin 2>/dev/null || true)"
-  if [[ -n "$url" ]]; then
-    echo "[comfyui-deploy] MSS-Login at ${canon} git remote (not used for detection): ${url}"
-  fi
-}
-
-seed_mss_login_into() {
-  local dest="$1"
-  local seed
-  seed="$(mss_login_baked_root)"
-  if dir_has_entries "$dest"; then
-    echo "[comfyui-deploy] ${dest} is not empty and is not an MSS-Login package; not overwriting it." >&2
-    return 1
-  fi
-  if ! is_mss_login_tree "$seed"; then
-    echo "[comfyui-deploy] MSS-Login seed at ${seed} does not contain the package marker." >&2
-    return 1
-  fi
-  echo "[comfyui-deploy] Seeding MSS-Login into ${dest} from the image pin."
-  mkdir -p "$dest"
-  cp -a "${seed}/." "${dest}/"
+  return 1
 }
 
 mss_login_break_glass() {
   # Emergency only via the process environment (docker run -e). A file on the
-  # mss-data volume is ignored; uid 1000 can write that mount.
+  # mss-data volume is ignored; uid 1000 can write that mount. The variable
+  # does not select the host tree and does not skip the shadow checks.
   is_truthy "${MSS_LOGIN_ALLOW_UNPINNED:-false}"
-}
-
-host_tree_has_bytecode() {
-  local dir="$1"
-  local hit
-  hit="$(find -P "$dir" \( -name .git -prune \) -o \( -type d -name __pycache__ -o -type f -iname '*.pyc' -o -type f -iname '*.pyo' \) -print -quit)"
-  [[ -n "$hit" ]]
-}
-
-# Content plus a real commit. HEAD text alone is not enough.
-exact_mss_login_copy() {
-  local dir="$1"
-  local baked expected actual canon top status
-  [[ -d "$dir" && ! -L "$dir" ]] || return 1
-  canon="$(realpath "$dir")"
-  baked="$(mss_login_baked_root)"
-  [[ -d "$baked" ]] || return 1
-  if host_tree_has_bytecode "$canon"; then
-    return 1
-  fi
-  if ! diff -rq --exclude=.git --no-dereference "$baked" "$canon" >/dev/null 2>&1; then
-    return 1
-  fi
-  if [[ ! -f "$(mss_login_revision_file)" ]]; then
-    return 1
-  fi
-  expected="$(tr -d '[:space:]' <"$(mss_login_revision_file)")"
-  expected="${expected,,}"
-  [[ -n "$expected" ]] || return 1
-  if ! top="$(git -C "$canon" -c safe.directory="$canon" rev-parse --show-toplevel 2>/dev/null)"; then
-    return 1
-  fi
-  top="$(realpath "$top")"
-  [[ "$top" == "$canon" ]] || return 1
-  if ! git -C "$canon" -c safe.directory="$canon" cat-file -e "${expected}^{commit}" 2>/dev/null; then
-    return 1
-  fi
-  if ! actual="$(git -C "$canon" -c safe.directory="$canon" rev-parse HEAD 2>/dev/null)"; then
-    return 1
-  fi
-  actual="$(printf '%s' "$actual" | tr -d '[:space:]')"
-  actual="${actual,,}"
-  [[ "$actual" == "$expected" ]] || return 1
-  status="$(git -C "$canon" -c safe.directory="$canon" status --porcelain --untracked-files=all --ignored 2>/dev/null || true)"
-  [[ -z "$status" ]] || return 1
-  return 0
-}
-
-log_pin_facts() {
-  local dir="$1"
-  local expected="" actual="" canon
-  [[ -e "$dir" ]] || return 0
-  canon="$(realpath "$dir")"
-  if [[ -f "$(mss_login_revision_file)" ]]; then
-    expected="$(tr -d '[:space:]' <"$(mss_login_revision_file)")"
-  fi
-  actual="$(git -C "$canon" -c safe.directory="$canon" rev-parse HEAD 2>/dev/null || true)"
-  actual="$(printf '%s' "$actual" | tr -d '[:space:]')"
-  echo "[comfyui-deploy] Image REVISION: ${expected:-<empty>}" >&2
-  if [[ -n "$actual" ]]; then
-    echo "[comfyui-deploy] Checkout HEAD: ${actual}" >&2
-  else
-    echo "[comfyui-deploy] Checkout HEAD: (none; no git checkout)" >&2
-  fi
 }
 
 refuse_mss_login() {
@@ -312,59 +237,297 @@ refuse_mss_login() {
   exit 1
 }
 
-prepare_mss_login() {
-  local nodes_root dest base line
-  local -a found=()
+mss_login_shadow_dest() {
+  local nodes_root base
   nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
   base="${MSS_LOGIN_DIR:-MSS-Login}"
-  if [[ -z "$base" || "$base" == */* || "$base" == .* || "$base" == *..* ]]; then
+  if [[ -z "$base" || "$base" == "." || "$base" == ".." || "$base" == *"/"* || "$base" == *$'\n'* ]]; then
     echo "[comfyui-deploy] MSS_LOGIN_DIR must be a single folder name." >&2
-    exit 1
+    return 1
   fi
-  mkdir -p "$nodes_root"
-  load_mss_login_fingerprints
+  printf '%s\n' "${nodes_root}/${base}"
+}
+
+mss_mountinfo_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_MOUNTINFO:-}" ]]; then
+    printf '%s\n' "$MSS_MOUNTINFO"
+  else
+    printf '%s\n' "/proc/self/mountinfo"
+  fi
+}
+
+unescape_mount_field() {
+  local value="$1"
+  value="${value//\\040/ }"
+  value="${value//\\011/$'\t'}"
+  value="${value//\\012/$'\n'}"
+  value="${value//\\134/\\}"
+  printf '%s' "$value"
+}
+
+# Last mountinfo entry whose mount point is exactly $1. Field 5 is the
+# mount point; the fstype is the token after " - ".
+mount_fstype() {
+  local want="$1"
+  local info line point fstype last=""
+  info="$(mss_mountinfo_file)"
+  [[ -r "$info" ]] || return 1
+  want="$(realpath -m "$want")"
   while IFS= read -r line; do
-    [[ -n "$line" ]] && found+=("$line")
-  done < <(discover_mss_login_dirs "$nodes_root")
+    [[ "$line" == *" - "* ]] || continue
+    point="$(awk '{print $5}' <<<"$line")"
+    point="$(unescape_mount_field "$point")"
+    point="$(realpath -m "$point")"
+    [[ "$point" == "$want" ]] || continue
+    fstype="${line#* - }"
+    fstype="${fstype%% *}"
+    last="$fstype"
+  done <"$info"
+  [[ -n "$last" ]] || return 1
+  printf '%s\n' "$last"
+}
 
-  if ((${#found[@]} > 1)); then
-    echo "[comfyui-deploy] Refusing to start: ${#found[@]} MSS-Login copies would load twice." >&2
-    for line in "${found[@]}"; do
-      echo "[comfyui-deploy]   ${line}" >&2
+mss_login_manifest_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_LOGIN_MANIFEST:-}" ]]; then
+    printf '%s\n' "$MSS_LOGIN_MANIFEST"
+  else
+    printf '%s\n' "/opt/mss-login/MANIFEST"
+  fi
+}
+
+resolve_manifest() {
+  local path tmp
+  path="$(mss_login_manifest_file)"
+  if [[ -f "$path" ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" ]]; then
+    tmp="$(mktemp)"
+    bash "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/scripts/write-mss-login-manifest.sh" "$(mss_login_baked_root)" "$tmp"
+    printf '%s\n' "$tmp"
+    return 0
+  fi
+  echo "[comfyui-deploy] Baked manifest missing at ${path}." >&2
+  return 1
+}
+
+manifest_rel_path() {
+  local line="$1" hash rel
+  hash="${line%% *}"
+  rel="${line#"${hash}"}"
+  rel="${rel#"${rel%%[![:space:]]*}"}"
+  printf '%s\n' "$rel"
+}
+
+manifest_path_ok() {
+  local rel="$1"
+  [[ -n "$rel" ]] || return 1
+  [[ "$rel" != /* ]] || return 1
+  [[ "$rel" != ".." && "$rel" != ../* && "$rel" != */.. && "$rel" != */../* ]] || return 1
+  return 0
+}
+
+copy_manifest_tree() {
+  local src="$1" dest="$2" manifest="$3"
+  local line hash rel parent
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    hash="${line%% *}"
+    rel="$(manifest_rel_path "$line")"
+    manifest_path_ok "$rel" || return 1
+    [[ -f "${src}/${rel}" && ! -L "${src}/${rel}" ]] || return 1
+    parent="$(dirname "$rel")"
+    mkdir -p "${dest}/${parent}" || return 1
+    cp -P -- "${src}/${rel}" "${dest}/${rel}" || return 1
+  done <"$manifest"
+}
+
+verify_manifest() {
+  local dest="$1" manifest="$2"
+  local list_got list_want line rel
+  list_got="$(mktemp)"
+  list_want="$(mktemp)"
+  (
+    cd "$dest" || exit 1
+    find . -type f -print | sed 's|^\./||' | sort
+  ) >"$list_got"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    rel="$(manifest_rel_path "$line")"
+    printf '%s\n' "$rel"
+  done <"$manifest" | sort >"$list_want"
+  if ! diff -q "$list_want" "$list_got" >/dev/null 2>&1; then
+    echo "[comfyui-deploy] Shadow file list does not match the baked manifest." >&2
+    diff -u "$list_want" "$list_got" >&2 || true
+    rm -f "$list_got" "$list_want"
+    return 1
+  fi
+  rm -f "$list_got" "$list_want"
+  if ! (cd "$dest" && sha256sum --quiet -c "$manifest"); then
+    echo "[comfyui-deploy] Shadow hashes do not match the baked manifest." >&2
+    return 1
+  fi
+  return 0
+}
+
+lock_shadow_root() {
+  local dest="$1"
+  chown -R root:root "$dest"
+  find "$dest" -type d -exec chmod 0755 {} +
+  find "$dest" -type f -exec chmod 0644 {} +
+}
+
+assert_uid1000_cannot_write() {
+  local dest="$1" file rc
+  file="$(find "$dest" -type f -print -quit)"
+  [[ -n "$file" ]] || return 1
+  set +e
+  setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- test -w "$dest"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    echo "[comfyui-deploy] uid ${COMFY_UID} can write the shadow directory ${dest}." >&2
+    return 1
+  fi
+  if [[ "$rc" -ne 1 ]]; then
+    echo "[comfyui-deploy] Could not check shadow directory writability (setpriv exit ${rc})." >&2
+    return 1
+  fi
+  set +e
+  setpriv --reuid="${COMFY_UID}" --regid="${COMFY_GID}" --init-groups --inh-caps=-all -- test -w "$file"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    echo "[comfyui-deploy] uid ${COMFY_UID} can write ${file}." >&2
+    return 1
+  fi
+  if [[ "$rc" -ne 1 ]]; then
+    echo "[comfyui-deploy] Could not check shadow file writability (setpriv exit ${rc})." >&2
+    return 1
+  fi
+  return 0
+}
+
+try_remount_shadow_ro() {
+  local dest="$1"
+  if mount -o remount,ro,noexec,nosuid "$dest"; then
+    echo "[comfyui-deploy] Remounted ${dest} read-only (noexec, nosuid)."
+    return 0
+  fi
+  echo "[comfyui-deploy] Could not remount ${dest} read-only. root:root with mode 0755 directories and 0644 files is the write barrier. uid ${COMFY_UID} cannot modify it." >&2
+  return 0
+}
+
+install_shadow_tree() {
+  local dest="$1"
+  local src manifest
+  src="$(mss_login_baked_root)"
+  if ! manifest="$(resolve_manifest)"; then
+    refuse_mss_login "Baked MSS-Login manifest is missing."
+  fi
+  if dir_has_entries "$dest"; then
+    refuse_mss_login "tmpfs at ${dest} is not empty before seeding."
+  fi
+  if ! is_mss_login_tree "$src"; then
+    refuse_mss_login "Baked MSS-Login at ${src} does not contain the package marker."
+  fi
+  echo "[comfyui-deploy] Seeding MSS-Login into tmpfs ${dest} from the image pin."
+  if ! copy_manifest_tree "$src" "$dest" "$manifest"; then
+    refuse_mss_login "Copy onto ${dest} failed. The host checkout was not used."
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    lock_shadow_root "$dest"
+  elif [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" ]]; then
+    echo "[comfyui-deploy] Test mode is not root; skipping chown. Production seeds as root and locks root:root."
+  else
+    refuse_mss_login "The shadow must be seeded as root before privileges are dropped."
+  fi
+  if ! verify_manifest "$dest" "$manifest"; then
+    refuse_mss_login "Shadow at ${dest} does not match the baked manifest."
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    if ! assert_uid1000_cannot_write "$dest"; then
+      refuse_mss_login "uid ${COMFY_UID} would be able to modify the shadow at ${dest}."
+    fi
+    try_remount_shadow_ro "$dest"
+  fi
+  echo "[comfyui-deploy] MSS-Login shadow at ${dest} matches the baked manifest."
+}
+
+verify_existing_shadow() {
+  local dest="$1"
+  local manifest owner
+  if ! manifest="$(resolve_manifest)"; then
+    refuse_mss_login "Baked MSS-Login manifest is missing."
+  fi
+  if ! verify_manifest "$dest" "$manifest"; then
+    refuse_mss_login "Shadow at ${dest} does not match the baked manifest."
+  fi
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" != "1" ]]; then
+    owner="$(stat -c '%u' "$dest")"
+    if [[ "$owner" != "0" ]]; then
+      refuse_mss_login "Shadow at ${dest} is owned by uid ${owner}. Expected root."
+    fi
+    if [[ -w "$dest" ]]; then
+      refuse_mss_login "Shadow directory ${dest} is writable by uid $(id -u)."
+    fi
+  fi
+  echo "[comfyui-deploy] MSS-Login shadow at ${dest} matches the baked manifest."
+}
+
+reject_other_mss_login_copies() {
+  local dest="$1"
+  local nodes_root path name canon_dest canon
+  local -a found=()
+  nodes_root="$(dirname "$dest")"
+  [[ -d "$nodes_root" ]] || return 0
+  load_root_fingerprints
+  canon_dest="$(realpath -m "$dest")"
+  shopt -s nullglob dotglob
+  for path in "${nodes_root}"/*; do
+    name="$(basename "$path")"
+    [[ "$name" == "." || "$name" == ".." ]] && continue
+    canon="$(realpath -m "$path")"
+    [[ "$canon" == "$canon_dest" ]] && continue
+    loader_would_import "$path" || continue
+    if entry_has_mss_login_signal "$path"; then
+      found+=("$path")
+    fi
+  done
+  shopt -u nullglob dotglob
+  if ((${#found[@]} > 0)); then
+    echo "[comfyui-deploy] Refusing to start: ${#found[@]} other MSS-Login copies would load twice." >&2
+    for path in "${found[@]}"; do
+      echo "[comfyui-deploy]   ${path}" >&2
     done
+    echo "[comfyui-deploy] The host checkout was not modified." >&2
     exit 1
   fi
+}
 
-  if ((${#found[@]} == 1)); then
-    MSS_LOGIN_RUNTIME_DIR="${found[0]}"
-    export MSS_DIR="$MSS_LOGIN_RUNTIME_DIR"
-    if exact_mss_login_copy "$MSS_LOGIN_RUNTIME_DIR"; then
-      if [[ "$(basename "$MSS_LOGIN_RUNTIME_DIR")" != "$base" ]]; then
-        echo "[comfyui-deploy] MSS-Login package is at ${MSS_LOGIN_RUNTIME_DIR}, not ${nodes_root}/${base}. Using the existing checkout and not seeding another copy."
-      else
-        echo "[comfyui-deploy] MSS-Login checkout at ${MSS_LOGIN_RUNTIME_DIR} is already present; leaving it unchanged."
-      fi
-      log_mss_login_remote "$MSS_LOGIN_RUNTIME_DIR"
-      echo "[comfyui-deploy] MSS-Login at ${MSS_LOGIN_RUNTIME_DIR} matches image pin $(tr -d '[:space:]' <"$(mss_login_revision_file)")."
-      return 0
-    fi
-    if mss_login_break_glass; then
-      log_pin_facts "$MSS_LOGIN_RUNTIME_DIR"
-      echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED=true is set for ${MSS_LOGIN_RUNTIME_DIR}. The tree does not match the image pin. This environment variable is an emergency bypass, not a normal start. The host checkout was not modified." >&2
-      return 0
-    fi
-    log_pin_facts "$MSS_LOGIN_RUNTIME_DIR"
-    refuse_mss_login "MSS-Login content at ${MSS_LOGIN_RUNTIME_DIR} does not exactly match the image pin (tree, commit object, or git status)."
+prepare_mss_login() {
+  local dest fstype
+  dest="$(mss_login_shadow_dest)" || exit 1
+  if ! fstype="$(mount_fstype "$dest")"; then
+    refuse_mss_login "MSS-Login shadow at ${dest} is not mounted. Refusing to read or import the host directory."
   fi
-
-  dest="${nodes_root}/${base}"
-  seed_mss_login_into "$dest"
-  MSS_LOGIN_RUNTIME_DIR="$dest"
+  if [[ "$fstype" != "tmpfs" ]]; then
+    refuse_mss_login "MSS-Login shadow at ${dest} is fstype ${fstype}, not tmpfs. Refusing to read or import the host directory."
+  fi
+  reject_other_mss_login_copies "$dest"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install_shadow_tree "$dest"
+  elif [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" ]] && ! dir_has_entries "$dest"; then
+    install_shadow_tree "$dest"
+  else
+    verify_existing_shadow "$dest"
+  fi
+  if mss_login_break_glass; then
+    echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED=true is set. The host MSS-Login tree is not loaded. The shadow at ${dest} is the image pin. This variable does not skip the tmpfs or manifest check." >&2
+  fi
   export MSS_DIR="$dest"
-  if ! exact_mss_login_copy "$MSS_LOGIN_RUNTIME_DIR"; then
-    refuse_mss_login "Seeded MSS-Login at ${dest} failed the image pin check."
-  fi
-  echo "[comfyui-deploy] MSS-Login at ${MSS_LOGIN_RUNTIME_DIR} matches image pin $(tr -d '[:space:]' <"$(mss_login_revision_file)")."
+  export MSS_LOGIN_RUNTIME_DIR="$dest"
 }
 
 requirement_line_rejected() {
@@ -403,7 +566,7 @@ consider_requirement_line() {
     return 0
   fi
   if requirement_line_rejected "$trimmed" || ! requirement_line_is_safe_spec "$trimmed"; then
-    echo "[comfyui-deploy] ${node_name}: ignoring requirement line: ${trimmed}" >&2
+    echo "[comfyui-deploy] Skipping requirement for node ${node_name}: ${trimmed}" >&2
     return 0
   fi
   printf '%s\n' "$trimmed" >>"$dest"
@@ -547,9 +710,23 @@ install_custom_node_deps() {
 }
 
 prepare_as_root() {
+  local dest fstype
   export HOME=/home/comfy
   export USER=comfy
   export LOGNAME=comfy
+
+  # Confirm the shadow mount before chown -R. A missing tmpfs would otherwise
+  # let chown walk the host MSS-Login checkout that the mount is supposed to hide.
+  dest="$(mss_login_shadow_dest)" || exit 1
+  if ! fstype="$(mount_fstype "$dest")"; then
+    refuse_mss_login "MSS-Login shadow at ${dest} is not mounted. Refusing to read or import the host directory."
+  fi
+  if [[ "$fstype" != "tmpfs" ]]; then
+    refuse_mss_login "MSS-Login shadow at ${dest} is fstype ${fstype}, not tmpfs. Refusing to read or import the host directory."
+  fi
+  if dir_has_entries "$dest"; then
+    refuse_mss_login "tmpfs at ${dest} is not empty before seeding."
+  fi
 
   ensure_owned "${MODELS_DIR:-/app/ComfyUI/models}"
   ensure_owned "${NODES_DIR:-/app/ComfyUI/custom_nodes}"
@@ -561,6 +738,10 @@ prepare_as_root() {
   ensure_owned /home/comfy/.cache/huggingface/hub
   ensure_owned /home/comfy/.cache/torch/hub
   ensure_owned /home/comfy/.bashrc file
+
+  # ensure_owned chowns the empty tmpfs to uid 1000. Seed after that and
+  # lock the copy back to root:root before setpriv.
+  prepare_mss_login
 }
 
 warn_if_insightface_models_missing() {

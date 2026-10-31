@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Exercises MSS-Login detection, the pin check, requirement filtering, and the
-# custom-node install cache. No network and no ComfyUI install.
+# Exercises the MSS-Login tmpfs shadow, duplicate detection, requirement
+# filtering, and the custom-node install cache. No network and no ComfyUI install.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,12 +24,21 @@ make_plugin() {
   local dir="$1"
   mkdir -p "${dir}/utils"
   printf 'name = "MSS-Login"\n' >"${dir}/pyproject.toml"
-  printf 'app.middlewares.append(access_control.create_mss_login_middleware())\n' >"${dir}/mss_login.py"
+  printf 'def create_mss_login_middleware():\n    return "ok"\n' >"${dir}/mss_login.py"
   git -C "$dir" init -q -b main
   git -C "$dir" config user.email test@example.com
   git -C "$dir" config user.name test
   git -C "$dir" add pyproject.toml mss_login.py
   git -C "$dir" commit -q -m init
+}
+
+arm_tmpfs() {
+  local dest="$1" fstype="${2:-tmpfs}"
+  mkdir -p "$dest"
+  MSS_MOUNTINFO="$(mktemp)"
+  export MSS_MOUNTINFO
+  dest="$(realpath -m "$dest")"
+  printf '36 35 0:46 / %s rw,nosuid,nodev,noexec - %s %s rw,uid=0,gid=0\n' "$dest" "$fstype" "$fstype" >"$MSS_MOUNTINFO"
 }
 
 new_case() {
@@ -63,10 +72,10 @@ EOF
   if grep -E -q 'extra-index-url|trusted-host|find-links|git\+|example.com' "$dest"; then
     fail "filtered file still has a supply-chain line: $(cat "$dest")"
   fi
-  grep -q 'ignoring requirement line: --extra-index-url' "$err" || fail "did not log extra-index-url"
-  grep -q 'ignoring requirement line: -i ' "$err" || fail "did not log -i"
-  grep -q 'ignoring requirement line: --trusted-host' "$err" || fail "did not log trusted-host"
-  grep -q 'ignoring requirement line: git+https://' "$err" || fail "did not log git+"
+  grep -q 'Skipping requirement for node DemoNode: --extra-index-url' "$err" || fail "did not log extra-index-url"
+  grep -q 'Skipping requirement for node DemoNode: -i ' "$err" || fail "did not log -i"
+  grep -q 'Skipping requirement for node DemoNode: --trusted-host' "$err" || fail "did not log trusted-host"
+  grep -q 'Skipping requirement for node DemoNode: git+https://github.com/example/pkg.git' "$err" || fail "did not log the skipped VCS line"
   if grep -q 'git+' "$dest"; then
     fail "URL requirements must be dropped even for MSS-Login"
   fi
@@ -154,64 +163,197 @@ EOF
   echo "cache case passed"
 }
 
-seed_case() {
-  local base seed nodes rev sha
+run_prepare() {
+  local log status arg key value
+  log="$(mktemp)"
+  set +e
+  (
+    for arg in "$@"; do
+      key="${arg%%=*}"
+      value="${arg#*=}"
+      export "${key}=${value}"
+    done
+    prepare_mss_login
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  printf '%s\n' "$status"
+  cat "$log"
+  rm -f "$log"
+}
+
+expect_refuse() {
+  local label="$1"
+  shift
+  local out status
+  out="$(run_prepare "$@")"
+  status="${out%%$'\n'*}"
+  [[ "$status" -ne 0 ]] || fail "${label} should refuse: ${out}"
+  grep -q 'Refusing to start' <<<"$out" || fail "${label} missing Refusing: ${out}"
+  printf '%s\n' "$out"
+}
+
+shadow_case() {
+  local base seed nodes rev dest snapshot log out
   base="$(new_case)"
   seed="${base}/seed"
   nodes="${base}/custom_nodes"
   rev="${base}/REVISION"
-  mkdir -p "$nodes"
+  snapshot="${base}/host-snapshot"
+  dest="${nodes}/MSS-Login"
   make_plugin "$seed"
-  sha="$(git -C "$seed" rev-parse HEAD)"
-  printf '%s\n' "$sha" >"$rev"
+  mkdir -p "${seed}/__pycache__"
+  printf 'print("from-seed-pyc")\n' >"${seed}/__pycache__/mss_login.cpython-313.pyc"
+  mkdir -p "${snapshot}/.venv/lib" "${snapshot}/__pycache__"
+  printf 'host-only\n' >"${snapshot}/HOST_ONLY.txt"
+  printf 'host-venv\n' >"${snapshot}/.venv/lib/marker.txt"
+  printf 'print("pwned")\n' >"${snapshot}/__pycache__/mss_login.cpython-313.pyc"
+  printf '%s\n' "$(git -C "$seed" rev-parse HEAD)" >"$rev"
+  arm_tmpfs "$dest"
   MSS_LOGIN_SEED="$seed" \
     MSS_LOGIN_REVISION_FILE="$rev" \
     NODES_DIR="$nodes" \
     MSS_LOGIN_DIR="MSS-Login" \
     MSS_LOGIN_ALLOW_UNPINNED="false" \
     prepare_mss_login
-  [[ -f "${nodes}/MSS-Login/pyproject.toml" ]] || fail "seed did not create MSS-Login"
-  [[ -d "${nodes}/MSS-Login/.git" ]] || fail "seed did not copy the git checkout"
-  assert_eq "${MSS_DIR}" "${nodes}/MSS-Login" "seeded runtime dir"
+  [[ -f "${dest}/pyproject.toml" ]] || fail "shadow was not seeded"
+  [[ -f "${dest}/mss_login.py" ]] || fail "shadow is missing mss_login.py"
+  [[ ! -e "${dest}/.git" ]] || fail "shadow copied .git"
+  [[ ! -e "${dest}/__pycache__" ]] || fail "shadow copied bytecode"
+  [[ ! -e "${dest}/.venv" ]] || fail "shadow copied .venv"
+  [[ ! -e "${dest}/HOST_ONLY.txt" ]] || fail "host snapshot leaked into the shadow"
+  assert_eq "$(cat "${snapshot}/HOST_ONLY.txt")" "host-only" "host snapshot was modified"
+  assert_eq "${MSS_DIR}" "${dest}" "runtime dir is the shadow"
+  python3 - <<PY
+import os, sys
+sys.path.insert(0, "${dest}")
+import mss_login
+assert mss_login.create_mss_login_middleware() == "ok"
+assert not os.path.isdir(os.path.join("${dest}", "__pycache__"))
+prefix = os.environ["PYTHONPYCACHEPREFIX"]
+assert prefix == "/tmp/comfy-pycache"
+found = []
+for root, dirs, files in os.walk(prefix):
+    for name in files:
+        if name.startswith("mss_login"):
+            found.append(os.path.join(root, name))
+assert found, "import did not write bytecode under PYTHONPYCACHEPREFIX"
+for path in found:
+    assert path.startswith(prefix + os.sep)
+    assert "${snapshot}" not in path
+PY
   rm -rf "$base"
-  echo "seed case passed"
+  unset MSS_MOUNTINFO
+  echo "shadow case passed"
 }
 
-different_folder_case() {
-  local base seed nodes rev sha
+missing_mount_case() {
+  local base seed nodes dest before
   base="$(new_case)"
   seed="${base}/seed"
   nodes="${base}/custom_nodes"
-  rev="${base}/REVISION"
-  mkdir -p "$nodes"
+  dest="${nodes}/MSS-Login"
   make_plugin "$seed"
-  make_plugin "${nodes}/LegacyFolder"
-  sha="$(git -C "${nodes}/LegacyFolder" rev-parse HEAD)"
-  printf '%s\n' "$sha" >"$rev"
-  local log
-  log="$(mktemp)"
-  MSS_LOGIN_SEED="$seed" \
-    MSS_LOGIN_REVISION_FILE="$rev" \
+  mkdir -p "${dest}/.venv" "${dest}/__pycache__"
+  printf 'leave-me\n' >"${dest}/HOST_ONLY.txt"
+  printf 'pyc\n' >"${dest}/__pycache__/mss_login.cpython-313.pyc"
+  before="$(sha256sum "${dest}/HOST_ONLY.txt")"
+  unset MSS_MOUNTINFO
+  expect_refuse "missing shadow mount" \
+    MSS_LOGIN_SEED="$seed" \
+    MSS_LOGIN_REVISION_FILE="${base}/REVISION" \
     NODES_DIR="$nodes" \
     MSS_LOGIN_DIR="MSS-Login" \
-    MSS_LOGIN_ALLOW_UNPINNED="false" \
-    prepare_mss_login >"$log"
-  [[ ! -e "${nodes}/MSS-Login" ]] || fail "seeded a second copy beside LegacyFolder"
-  assert_eq "${MSS_DIR}" "${nodes}/LegacyFolder" "runtime dir follows the existing package"
-  grep -q 'LegacyFolder' "$log" || fail "did not log the folder that is used"
-  rm -f "$log"
+    MSS_LOGIN_ALLOW_UNPINNED="true" >/dev/null
+  assert_eq "$(sha256sum "${dest}/HOST_ONLY.txt")" "$before" "missing mount modified the host file"
+  [[ -f "${dest}/__pycache__/mss_login.cpython-313.pyc" ]] || fail "missing mount removed the host pyc"
+  arm_tmpfs "$dest" "ext4"
+  expect_refuse "non-tmpfs mount" \
+    MSS_LOGIN_SEED="$seed" \
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login" >/dev/null
+  assert_eq "$(cat "${dest}/HOST_ONLY.txt")" "leave-me" "ext4 mount modified the host file"
   rm -rf "$base"
-  echo "different folder case passed"
+  unset MSS_MOUNTINFO
+  echo "missing mount case passed"
 }
 
-remote_only_case() {
-  local base seed nodes rev decoy status log
+nonempty_tmpfs_case() {
+  local base seed nodes dest
   base="$(new_case)"
   seed="${base}/seed"
   nodes="${base}/custom_nodes"
-  rev="${base}/REVISION"
+  dest="${nodes}/MSS-Login"
+  make_plugin "$seed"
+  arm_tmpfs "$dest"
+  printf 'already\n' >"${dest}/preexisting.txt"
+  expect_refuse "non-empty tmpfs" \
+    MSS_LOGIN_SEED="$seed" \
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login" >/dev/null
+  assert_eq "$(cat "${dest}/preexisting.txt")" "already" "non-empty tmpfs was overwritten"
+  [[ ! -f "${dest}/pyproject.toml" ]] || fail "non-empty tmpfs was seeded"
+  rm -rf "$base"
+  unset MSS_MOUNTINFO
+  echo "non-empty tmpfs case passed"
+}
+
+duplicate_case() {
+  local base seed nodes dest log
+  base="$(new_case)"
+  seed="${base}/seed"
+  nodes="${base}/custom_nodes"
+  dest="${nodes}/MSS-Login"
+  make_plugin "$seed"
+  make_plugin "${nodes}/ComfyUI-MSS-Login"
+  printf 'def create_mss_login_middleware():\n    return "py"\n' >"${nodes}/also_login.py"
+  mkdir -p "${nodes}/.hidden-node"
+  cp "${seed}/pyproject.toml" "${nodes}/.hidden-node/pyproject.toml"
+  cp "${seed}/mss_login.py" "${nodes}/.hidden-node/mss_login.py"
+  mkdir -p "${nodes}/SkipMe.disabled" "${nodes}/__pycache__" "${nodes}/Other.venv"
+  cp "${seed}/pyproject.toml" "${nodes}/SkipMe.disabled/pyproject.toml"
+  cp "${seed}/mss_login.py" "${nodes}/__pycache__/mss_login.py"
+  printf 'not a node\n' >"${nodes}/readme.txt"
+  printf 'print("pyc")\n' >"${nodes}/evil.pyc"
+  mkdir -p "${nodes}/Pack/MSS-Login"
+  cp "${seed}/pyproject.toml" "${nodes}/Pack/MSS-Login/pyproject.toml"
+  printf 'plain\n' >"${nodes}/Pack/readme.txt"
+  arm_tmpfs "$dest"
+  log="$(expect_refuse "duplicate folder, py file, and hidden dir" \
+    MSS_LOGIN_SEED="$seed" \
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login")"
+  grep -q 'would load twice' <<<"$log" || fail "duplicate message missing: ${log}"
+  grep -q 'ComfyUI-MSS-Login' <<<"$log" || fail "did not list the renamed folder"
+  grep -q 'also_login.py' <<<"$log" || fail "did not list the .py file"
+  grep -q '.hidden-node' <<<"$log" || fail "hidden directory was skipped"
+  if grep -q 'SkipMe.disabled' <<<"$log"; then
+    fail "loader-skipped .disabled was treated as a duplicate"
+  fi
+  if grep -q '__pycache__' <<<"$log"; then
+    fail "loader-skipped __pycache__ was treated as a duplicate"
+  fi
+  if grep -q 'evil.pyc' <<<"$log"; then
+    fail "non-.py file was treated as a duplicate"
+  fi
+  if grep -q 'Pack/MSS-Login' <<<"$log"; then
+    fail "nested package was treated as a top-level import"
+  fi
+  [[ ! -f "${dest}/pyproject.toml" ]] || fail "duplicate still seeded the shadow"
+  rm -rf "$base"
+  unset MSS_MOUNTINFO
+  echo "duplicate case passed"
+}
+
+remote_and_hash_case() {
+  local base seed nodes dest decoy log
+  base="$(new_case)"
+  seed="${base}/seed"
+  nodes="${base}/custom_nodes"
+  dest="${nodes}/MSS-Login"
   decoy="${nodes}/NotThePlugin"
-  mkdir -p "$nodes" "$decoy"
+  make_plugin "$seed"
+  mkdir -p "$decoy"
   git -C "$decoy" init -q -b main
   git -C "$decoy" config user.email test@example.com
   git -C "$decoy" config user.name test
@@ -219,231 +361,73 @@ remote_only_case() {
   git -C "$decoy" add README.md
   git -C "$decoy" commit -q -m decoy
   git -C "$decoy" remote add origin https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
-  make_plugin "$seed"
-  printf '%s\n' "$(git -C "$seed" rev-parse HEAD)" >"$rev"
-  log="$(mktemp)"
-  set +e
-  (
+  arm_tmpfs "$dest"
+  log="$(expect_refuse "git remote at the entry root" \
     MSS_LOGIN_SEED="$seed" \
-      MSS_LOGIN_REVISION_FILE="$rev" \
-      NODES_DIR="$nodes" \
-      MSS_LOGIN_DIR="MSS-Login" \
-      prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "git remote alone was allowed to sit beside a seeded copy"
-  [[ ! -e "${nodes}/MSS-Login" ]] || fail "seeded a second copy beside a remote match"
-  grep -q 'Refusing' "$log" || fail "remote-only refusal missing"
-  rm -f "$log"
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login")"
+  grep -q 'NotThePlugin' <<<"$log" || fail "remote-only entry was not listed"
+  rm -rf "$decoy"
+  mkdir -p "${nodes}/Altered"
+  cp "${seed}/mss_login.py" "${nodes}/Altered/core.py"
+  printf 'name = "Not-It"\n' >"${nodes}/Altered/pyproject.toml"
+  log="$(expect_refuse "root file hash" \
+    MSS_LOGIN_SEED="$seed" \
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login")"
+  grep -q 'Altered' <<<"$log" || fail "hashed root file was not listed: ${log}"
   rm -rf "$base"
-  echo "remote-only case passed"
+  unset MSS_MOUNTINFO
+  echo "remote and hash case passed"
 }
 
-two_copies_case() {
-  local base nodes status log
-  base="$(new_case)"
-  nodes="${base}/custom_nodes"
-  mkdir -p "$nodes"
-  make_plugin "${nodes}/MSS-Login"
-  make_plugin "${nodes}/ComfyUI-MSS-Login"
-  log="$(mktemp)"
-  set +e
-  (
-    NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "two copies were allowed to start"
-  grep -q 'would load twice' "$log" || fail "two-copy message missing: $(cat "$log")"
-  grep -q 'MSS-Login' "$log" || fail "did not list MSS-Login"
-  grep -q 'ComfyUI-MSS-Login' "$log" || fail "did not list ComfyUI-MSS-Login"
-  rm -f "$log"
-  rm -rf "$base"
-  echo "two copies case passed"
-}
-
-attack_cases() {
-  local base seed nodes rev sha status log
+break_glass_case() {
+  local base seed nodes dest data log
   base="$(new_case)"
   seed="${base}/seed"
   nodes="${base}/custom_nodes"
-  rev="${base}/REVISION"
-  mkdir -p "$nodes"
-  make_plugin "$seed"
-  sha="$(git -C "$seed" rev-parse HEAD)"
-  printf '%s\n' "$sha" >"$rev"
-
-  run_prepare() {
-    local label="$1"
-    shift
-    log="$(mktemp)"
-    set +e
-    (
-      MSS_LOGIN_SEED="$seed" MSS_LOGIN_REVISION_FILE="$rev" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
-    ) >"$log" 2>&1
-    status=$?
-    set -e
-    if [[ "$1" == "ok" ]]; then
-      [[ "$status" -eq 0 ]] || fail "${label} should start: $(cat "$log")"
-    else
-      [[ "$status" -ne 0 ]] || fail "${label} should refuse: $(cat "$log")"
-      grep -q 'Refusing' "$log" || fail "${label} missing Refusing: $(cat "$log")"
-    fi
-    rm -f "$log"
-  }
-
-  rm -rf "$nodes"
-  mkdir -p "$nodes"
-  cp -a "$seed" "${nodes}/MSS-Login"
-  run_prepare "clean copy" ok
-
-  echo 'print("backdoor")' >>"${nodes}/MSS-Login/mss_login.py"
-  run_prepare "dirty file" bad
-  git -C "${nodes}/MSS-Login" checkout -q -- mss_login.py
-
-  echo 'x=1' >"${nodes}/MSS-Login/extra_evil.py"
-  run_prepare "untracked file" bad
-  rm -f "${nodes}/MSS-Login/extra_evil.py"
-
-  rm -rf "${nodes}/MSS-Login/.git"
-  git -C "${nodes}/MSS-Login" init -q
-  printf '%s\n' "$sha" >"${nodes}/MSS-Login/.git/HEAD"
-  run_prepare "forged HEAD" bad
-
-  rm -rf "$nodes"
-  mkdir -p "$nodes"
-  cp -a "$seed" "${nodes}/Altered"
-  sed -i 's/^name = "MSS-Login"/name = "Not-It"/' "${nodes}/Altered/pyproject.toml"
-  mv "${nodes}/Altered/mss_login.py" "${nodes}/Altered/core.py"
-  run_prepare "renamed entry module" bad
-  [[ ! -e "${nodes}/MSS-Login" ]] || fail "altered copy caused a second seed"
-
-  rm -rf "$base"
-  echo "attack cases passed"
-}
-
-mismatch_case() {
-  local base nodes rev status log sha
-  base="$(new_case)"
-  nodes="${base}/custom_nodes"
-  rev="${base}/REVISION"
-  mkdir -p "$nodes"
-  make_plugin "${nodes}/MSS-Login"
-  sha="$(git -C "${nodes}/MSS-Login" rev-parse HEAD)"
-  printf '%s\n' "0123456789abcdef0123456789abcdef01234567" >"$rev"
-  log="$(mktemp)"
-  set +e
-  (
-    MSS_LOGIN_REVISION_FILE="$rev" \
-      NODES_DIR="$nodes" \
-      MSS_LOGIN_DIR="MSS-Login" \
-      MSS_LOGIN_ALLOW_UNPINNED="false" \
-      prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "mismatched HEAD was allowed"
-  grep -q '0123456789abcdef0123456789abcdef01234567' "$log" || fail "did not log image revision"
-  grep -q "$sha" "$log" || fail "did not log checkout HEAD"
-  grep -q 'was not modified' "$log" || fail "did not say the checkout was left alone"
-  rm -f "$log"
-  echo "mismatch case passed"
-
-  log="$(mktemp)"
-  set +e
-  (
-    MSS_LOGIN_REVISION_FILE="$rev" \
-      NODES_DIR="$nodes" \
-      MSS_LOGIN_DIR="MSS-Login" \
-      MSS_LOGIN_ALLOW_UNPINNED="true" \
-      prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -eq 0 ]] || fail "ALLOW_UNPINNED should continue (status ${status}): $(cat "$log")"
-  grep -q 'WARNING: MSS_LOGIN_ALLOW_UNPINNED' "$log" || fail "opt-out was not a loud warning"
-  rm -f "$log"
-  rm -rf "$base"
-  echo "unpinned opt-out case passed"
-}
-
-bytecode_and_breakglass_cases() {
-  local base seed nodes rev sha data log status
-  base="$(new_case)"
-  seed="${base}/seed"
-  nodes="${base}/custom_nodes"
-  rev="${base}/REVISION"
+  dest="${nodes}/MSS-Login"
   data="${base}/data"
-  mkdir -p "$nodes" "$data"
   make_plugin "$seed"
-  sha="$(git -C "$seed" rev-parse HEAD)"
-  printf '%s\n' "$sha" >"$rev"
-  cp -a "$seed" "${nodes}/MSS-Login"
-  mkdir -p "${nodes}/MSS-Login/__pycache__"
-  printf 'not-bytecode\n' >"${nodes}/MSS-Login/__pycache__/mss_login.cpython-313.pyc"
-  log="$(mktemp)"
-  set +e
-  (
-    MSS_LOGIN_SEED="$seed" MSS_LOGIN_REVISION_FILE="$rev" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "planted pyc was allowed: $(cat "$log")"
-  grep -q 'Refusing' "$log" || fail "pyc plant missing Refusing"
-  rm -rf "${nodes}/MSS-Login/__pycache__"
-
-  printf '%s\n' '*.secret' >"${nodes}/MSS-Login/.gitignore"
-  git -C "${nodes}/MSS-Login" add .gitignore
-  git -C "${nodes}/MSS-Login" commit -q -m 'ignore secrets'
-  # The pin is the original commit. Move HEAD back so the only extra content is ignored.
-  git -C "${nodes}/MSS-Login" reset -q --hard "$sha"
-  printf 'hidden\n' >"${nodes}/MSS-Login/creds.secret"
-  # .gitignore from the later commit is gone after reset. Install the ignore rule in the index commit that matches the seed.
-  # Re-apply an ignore that exists in the pinned tree by using exclude, which status --ignored still reports.
-  mkdir -p "${nodes}/MSS-Login/.git/info"
-  printf '%s\n' 'creds.secret' >>"${nodes}/MSS-Login/.git/info/exclude"
-  log="$(mktemp)"
-  set +e
-  (
-    MSS_LOGIN_SEED="$seed" MSS_LOGIN_REVISION_FILE="$rev" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "gitignored file was allowed: $(cat "$log")"
-  grep -q 'Refusing' "$log" || fail "gitignored file missing Refusing"
-
+  mkdir -p "$data"
   touch "${data}/MSS_LOGIN_BREAK_GLASS"
-  echo 'print("backdoor")' >>"${nodes}/MSS-Login/mss_login.py"
-  log="$(mktemp)"
-  set +e
-  (
+  unset MSS_MOUNTINFO
+  log="$(expect_refuse "break-glass file without a shadow" \
     MSS_LOGIN_SEED="$seed" \
-      MSS_LOGIN_REVISION_FILE="$rev" \
-      NODES_DIR="$nodes" \
-      MSS_LOGIN_DIR="MSS-Login" \
-      MSS_LOGIN_DATA_DIR="$data" \
-      prepare_mss_login
-  ) >"$log" 2>&1
-  status=$?
-  set -e
-  [[ "$status" -ne 0 ]] || fail "break-glass file was honored: $(cat "$log")"
-  if grep -q 'break-glass is enabled' "$log"; then
-    fail "break-glass file produced the bypass warning"
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login" \
+    MSS_LOGIN_DATA_DIR="$data" \
+    MSS_LOGIN_ALLOW_UNPINNED="false")"
+  if grep -q 'WARNING: MSS_LOGIN_ALLOW_UNPINNED=true' <<<"$log"; then
+    fail "break-glass file produced the env warning"
   fi
-  rm -f "$log"
+  arm_tmpfs "$dest"
+  MSS_LOGIN_SEED="$seed" \
+    NODES_DIR="$nodes" \
+    MSS_LOGIN_DIR="MSS-Login" \
+    MSS_LOGIN_DATA_DIR="$data" \
+    MSS_LOGIN_ALLOW_UNPINNED="true" \
+    prepare_mss_login >"${base}/ok.log" 2>&1
+  grep -q 'WARNING: MSS_LOGIN_ALLOW_UNPINNED=true is set' "${base}/ok.log" || fail "opt-out was not a loud warning: $(cat "${base}/ok.log")"
+  grep -q 'does not skip the tmpfs' "${base}/ok.log" || fail "warning did not say the shadow still applies"
+  [[ -f "${dest}/mss_login.py" ]] || fail "pinned shadow was not seeded"
+  if grep -q 'host MSS-Login tree is not loaded' "${base}/ok.log"; then
+    :
+  else
+    fail "warning did not say the host tree is not loaded"
+  fi
   rm -rf "$base"
+  unset MSS_MOUNTINFO
   [[ "${PYTHONPYCACHEPREFIX:-}" == "/tmp/comfy-pycache" ]] || fail "PYTHONPYCACHEPREFIX was not set by the entrypoint"
-  echo "bytecode and break-glass cases passed"
+  echo "break-glass case passed"
 }
 
 filter_case
 cache_case
-seed_case
-different_folder_case
-remote_only_case
-two_copies_case
-mismatch_case
-attack_cases
-bytecode_and_breakglass_cases
+shadow_case
+missing_mount_case
+nonempty_tmpfs_case
+duplicate_case
+remote_and_hash_case
+break_glass_case
 echo "all runtime guard tests passed"

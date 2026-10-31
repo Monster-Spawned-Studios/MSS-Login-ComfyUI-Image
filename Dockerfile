@@ -1,8 +1,8 @@
 # ComfyUI runtime. ComfyUI-MSS-Login is not in this repository; the image
 # fetches it over HTTPS at build time. The single pin is MSS_LOGIN_REF
 # (development 1d9acbcee661088145e0adb38ab1dc829393108f). The full sha is
-# written to /opt/mss-login/REVISION and the entrypoint refuses a checkout
-# whose HEAD differs.
+# written to /opt/mss-login/REVISION. The entrypoint does not run the host
+# checkout. It copies this tree onto a root-owned tmpfs and checks MANIFEST.
 # https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login
 #
 # Targets: cpu, nvidia, rocm, auto. The GitHub workflow publishes nvidia only.
@@ -82,7 +82,14 @@ RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
 COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
 COPY --chmod=755 update.sh /app/update.sh
 COPY --chmod=755 scripts/write-torch-constraints.sh /app/write-torch-constraints.sh
+COPY --chmod=755 scripts/write-mss-login-manifest.sh /app/scripts/write-mss-login-manifest.sh
 COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
+
+# facebookresearch/sam2 main at the time of this pin. The wheel is built in
+# this stage with CUDA extensions off, hash-checked, and installed with
+# --require-hashes. Impact-Pack's git+ line is dropped at runtime.
+ARG SAM2_REPO=https://github.com/facebookresearch/sam2.git
+ARG SAM2_REF=2b90b9f5ceec907a1c18123530e92e794ad901a4
 
 RUN mkdir -p \
         /data/mss-login \
@@ -104,7 +111,52 @@ RUN mkdir -p \
     && chmod 1777 /tmp/comfy-pycache \
     && /app/write-torch-constraints.sh \
     && cp /opt/mss-login/REVISION /app/ComfyUI/.venv/.mss-build-id \
-    && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/mss-login /opt/uv-python /opt/uv-tools /opt/comfy-constraints
+    && /app/scripts/write-mss-login-manifest.sh /opt/mss-login/ComfyUI-MSS-Login /opt/mss-login/MANIFEST \
+    && sp="$(/app/ComfyUI/.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
+    && printf '%s\n' 'import sys' 'sys.pycache_prefix = "/tmp/comfy-pycache"' > "${sp}/sitecustomize.py" \
+    && if [[ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2.git" && "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2" ]]; then \
+         echo "SAM2_REPO must be https://github.com/facebookresearch/sam2.git" >&2; \
+         exit 1; \
+       fi \
+    && if [[ "${SAM2_REPO}" == *"@"* ]]; then \
+         echo "SAM2_REPO must not embed credentials" >&2; \
+         exit 1; \
+       fi \
+    && if [[ ! "${SAM2_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
+         echo "SAM2_REF must be a full 40-character lowercase commit SHA" >&2; \
+         exit 1; \
+       fi \
+    && git init --quiet /tmp/sam2-src \
+    && git -C /tmp/sam2-src remote add origin "${SAM2_REPO}" \
+    && GIT_TERMINAL_PROMPT=0 git -C /tmp/sam2-src fetch --depth 1 origin "${SAM2_REF}" \
+    && git -C /tmp/sam2-src checkout --detach "${SAM2_REF}" \
+    && got="$(git -C /tmp/sam2-src rev-parse HEAD)" \
+    && if [[ "${got}" != "${SAM2_REF}" ]]; then \
+         echo "sam2 checkout ${got}, wanted ${SAM2_REF}" >&2; \
+         exit 1; \
+       fi \
+    && SAM2_BUILD_CUDA=0 uv build --wheel --out-dir /opt/sam2 /tmp/sam2-src \
+    && rm -rf /tmp/sam2-src \
+    && whl="$(find /opt/sam2 -maxdepth 1 -type f -name '*.whl' -print)" \
+    && if [[ -z "${whl}" || "$(printf '%s\n' "${whl}" | wc -l)" -ne 1 ]]; then \
+         echo "expected one sam2 wheel in /opt/sam2" >&2; \
+         exit 1; \
+       fi \
+    && sha256sum "${whl}" | awk '{print $1}' > /opt/sam2/SHA256 \
+    && printf '%s  %s\n' "$(tr -d '[:space:]' < /opt/sam2/SHA256)" "${whl}" > /opt/sam2/SHA256SUMS \
+    && sha256sum -c /opt/sam2/SHA256SUMS \
+    && printf 'SAM-2 @ file://%s --hash=sha256:%s\n' "${whl}" "$(tr -d '[:space:]' < /opt/sam2/SHA256)" > /opt/sam2/requirements.txt \
+    && printf '%s\n' "${SAM2_REF}" > /opt/sam2/REVISION \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python --no-deps --require-hashes -r /opt/sam2/requirements.txt \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
+         --constraint /opt/comfy-constraints/torch.txt \
+         "hydra-core==1.3.8" \
+         "iopath==0.1.10" \
+    && rm -rf /tmp/uv-cache \
+    && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/uv-python /opt/uv-tools /opt/comfy-constraints \
+    && chown -R root:root /opt/mss-login /opt/sam2 \
+    && find /opt/mss-login /opt/sam2 -type d -exec chmod 0755 {} + \
+    && find /opt/mss-login /opt/sam2 -type f -exec chmod 0644 {} +
 
 LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
       org.opencontainers.image.title="comfyui-mss-login" \
@@ -142,6 +194,9 @@ ARG CUDA_VERSION=cu130
 # this stage. insightface, onnx, gguf, and opencv-python-headless are pinned
 # to exact versions. The CPU onnxruntime distribution is removed if insightface
 # pulls it in. buffalo_l is not downloaded; mount a verified tree instead.
+# sam2 is already installed in the base stage from commit
+# 2b90b9f5ceec907a1c18123530e92e794ad901a4 (wheel sha256 recorded at
+# /opt/sam2/SHA256). This stage does not reinstall it.
 ENV DEVICE_TYPE=cuda \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
