@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Container entrypoint.
-# Starts as root (compose user 0:0) only long enough to give uid 1000 ownership
-# of root-owned volume data, seeds MSS-Login when the custom_nodes volume has
-# no checkout, then drops to uid 1000. An existing checkout is never replaced.
-# user-scripts/00-setup-uv-venv.sh is not executed; the cuDNN library path is
-# baked into the nvidia image for /app/ComfyUI/.venv.
+# Starts as root only long enough to give uid 1000 ownership of root-owned
+# volume data, then drops privileges. MSS-Login is detected by its package
+# (pyproject name or mss_login.py), never by folder name alone. An existing
+# checkout is never overwritten. Its git HEAD must match /opt/mss-login/REVISION
+# unless MSS_LOGIN_ALLOW_UNPINNED is set.
+# Custom-node requirements are installed as uid 1000, constrained to the torch
+# and CUDA wheels baked into the image.
 set -euo pipefail
 
 COMFY_UID=1000
@@ -17,6 +19,17 @@ ARCH="$(uname -m)"
 OS="$(uname -s)"
 VENV_DIR="${VIRTUAL_ENV:-/app/ComfyUI/.venv}"
 STAMP_FILE="${VENV_DIR}/.mss_torch_backend"
+MSS_TORCH_CONSTRAINTS="${MSS_TORCH_CONSTRAINTS:-/opt/comfy-constraints/torch.txt}"
+MSS_LOGIN_REVISION_FILE="${MSS_LOGIN_REVISION_FILE:-/opt/mss-login/REVISION}"
+
+is_truthy() {
+  local value="${1:-}"
+  value="${value,,}"
+  case "$value" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 dir_has_entries() {
   local path="$1"
@@ -53,26 +66,258 @@ ensure_owned() {
   chown -R "${COMFY_UID}:${COMFY_GID}" "$path"
 }
 
-seed_mss_login() {
-  local nodes_root dest seed
-  nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
-  dest="${nodes_root}/ComfyUI-MSS-Login"
-  seed="${MSS_LOGIN_SEED:-/opt/mss-login/ComfyUI-MSS-Login}"
-
-  mkdir -p "$nodes_root"
-  if dir_has_entries "$dest"; then
-    echo "[comfyui-deploy] MSS-Login checkout at ${dest} is already present; leaving it unchanged."
+# Primary detection: pyproject package name or the plugin entry module.
+# A git remote is not sufficient on its own.
+is_mss_login_tree() {
+  local dir="$1"
+  if [[ -f "${dir}/pyproject.toml" ]] && grep -E -q '^[[:space:]]*name[[:space:]]*=[[:space:]]*["'\'']MSS-Login["'\''][[:space:]]*$' "${dir}/pyproject.toml"; then
     return 0
   fi
-
-  if [[ ! -f "${seed}/__init__.py" ]]; then
-    echo "[comfyui-deploy] MSS-Login seed is missing at ${seed}." >&2
-    exit 1
+  if [[ -f "${dir}/mss_login.py" ]] && grep -q 'create_mss_login_middleware' "${dir}/mss_login.py"; then
+    return 0
   fi
+  return 1
+}
 
+discover_mss_login_dirs() {
+  local nodes_root="$1"
+  local dir name
+  [[ -d "$nodes_root" ]] || return 0
+  shopt -s nullglob
+  for dir in "${nodes_root}"/*; do
+    [[ -d "$dir" ]] || continue
+    name="$(basename "$dir")"
+    [[ "$name" == .* ]] && continue
+    if is_mss_login_tree "$dir"; then
+      printf '%s\n' "$dir"
+    fi
+  done
+  shopt -u nullglob
+}
+
+log_mss_login_remote() {
+  local dir="$1"
+  local canon url
+  canon="$(realpath "$dir")"
+  url="$(git -C "$canon" -c safe.directory="$canon" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$url" ]]; then
+    echo "[comfyui-deploy] MSS-Login at ${canon} git remote (not used for detection): ${url}"
+  fi
+}
+
+seed_mss_login_into() {
+  local dest="$1"
+  local seed="${MSS_LOGIN_SEED:-/opt/mss-login/ComfyUI-MSS-Login}"
+  if dir_has_entries "$dest"; then
+    echo "[comfyui-deploy] ${dest} is not empty and is not an MSS-Login package; not overwriting it." >&2
+    return 1
+  fi
+  if ! is_mss_login_tree "$seed"; then
+    echo "[comfyui-deploy] MSS-Login seed at ${seed} does not contain the package marker." >&2
+    return 1
+  fi
   echo "[comfyui-deploy] Seeding MSS-Login into ${dest} from the image pin."
   mkdir -p "$dest"
   cp -a "${seed}/." "${dest}/"
+}
+
+enforce_mss_login_pin() {
+  local dir="$1"
+  local expected="" actual="" canon
+  if [[ ! -f "$MSS_LOGIN_REVISION_FILE" ]]; then
+    echo "[comfyui-deploy] Image pin file ${MSS_LOGIN_REVISION_FILE} is missing." >&2
+    exit 1
+  fi
+  expected="$(tr -d '[:space:]' <"$MSS_LOGIN_REVISION_FILE")"
+  expected="${expected,,}"
+  canon="$(realpath "$dir")"
+  if ! actual="$(git -C "$canon" -c safe.directory="$canon" rev-parse HEAD 2>/dev/null)"; then
+    actual=""
+  fi
+  actual="$(printf '%s' "$actual" | tr -d '[:space:]')"
+  actual="${actual,,}"
+  if [[ -n "$actual" && "$actual" == "$expected" ]]; then
+    echo "[comfyui-deploy] MSS-Login at ${canon} matches image pin ${expected}."
+    return 0
+  fi
+  echo "[comfyui-deploy] MSS-Login pin mismatch at ${canon}." >&2
+  echo "[comfyui-deploy] Image REVISION: ${expected:-<empty>}" >&2
+  if [[ -n "$actual" ]]; then
+    echo "[comfyui-deploy] Checkout HEAD: ${actual}" >&2
+  else
+    echo "[comfyui-deploy] Checkout HEAD: (none; no git checkout)" >&2
+  fi
+  if is_truthy "${MSS_LOGIN_ALLOW_UNPINNED:-false}"; then
+    echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED is enabled. Continuing with this checkout instead of image pin ${expected}. The host checkout was not modified." >&2
+    return 0
+  fi
+  echo "[comfyui-deploy] Refusing to start. The host checkout was not modified. Set MSS_LOGIN_ALLOW_UNPINNED=true to run it anyway, or rebuild with MSS_LOGIN_REF set to the checkout sha." >&2
+  exit 1
+}
+
+prepare_mss_login() {
+  local nodes_root dest base line
+  local -a found=()
+  nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
+  base="${MSS_LOGIN_DIR:-MSS-Login}"
+  if [[ -z "$base" || "$base" == */* || "$base" == .* || "$base" == *..* ]]; then
+    echo "[comfyui-deploy] MSS_LOGIN_DIR must be a single folder name." >&2
+    exit 1
+  fi
+  mkdir -p "$nodes_root"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && found+=("$line")
+  done < <(discover_mss_login_dirs "$nodes_root")
+
+  if ((${#found[@]} > 1)); then
+    echo "[comfyui-deploy] Refusing to start: ${#found[@]} MSS-Login copies would load twice." >&2
+    for line in "${found[@]}"; do
+      echo "[comfyui-deploy]   ${line}" >&2
+    done
+    exit 1
+  fi
+
+  if ((${#found[@]} == 1)); then
+    MSS_LOGIN_RUNTIME_DIR="${found[0]}"
+    export MSS_DIR="$MSS_LOGIN_RUNTIME_DIR"
+    if [[ "$(basename "$MSS_LOGIN_RUNTIME_DIR")" != "$base" ]]; then
+      echo "[comfyui-deploy] MSS-Login package is at ${MSS_LOGIN_RUNTIME_DIR}, not ${nodes_root}/${base}. Using the existing checkout and not seeding another copy."
+    else
+      echo "[comfyui-deploy] MSS-Login checkout at ${MSS_LOGIN_RUNTIME_DIR} is already present; leaving it unchanged."
+    fi
+    log_mss_login_remote "$MSS_LOGIN_RUNTIME_DIR"
+  else
+    dest="${nodes_root}/${base}"
+    seed_mss_login_into "$dest"
+    MSS_LOGIN_RUNTIME_DIR="$dest"
+    export MSS_DIR="$dest"
+  fi
+  enforce_mss_login_pin "$MSS_LOGIN_RUNTIME_DIR"
+}
+
+requirement_line_forbidden() {
+  local line="$1"
+  [[ "$line" =~ (^|[[:space:]])(-i|--index-url|--extra-index-url|--trusted-host|--find-links)([[:space:]=]|$) ]] && return 0
+  [[ "$line" =~ (^|[[:space:]])-f[[:space:]] ]] && return 0
+  [[ "$line" =~ (^|[[:space:]])(-r|--requirement)([[:space:]=]|$) ]] && return 0
+  return 1
+}
+
+requirement_line_is_url() {
+  local line="$1"
+  [[ "$line" == *git+* ]] && return 0
+  [[ "$line" =~ ^[[:space:]]*(https?|ssh|git):// ]] && return 0
+  [[ "$line" =~ @[[:space:]]*(https?|ssh|git):// ]] && return 0
+  [[ "$line" =~ @[[:space:]]*git\+ ]] && return 0
+  return 1
+}
+
+filter_requirements_file() {
+  local src="$1" dest="$2" node_name="$3" allow_urls="$4"
+  local line trimmed
+  : >"$dest"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -z "$trimmed" || "${trimmed}" == \#* ]]; then
+      continue
+    fi
+    if requirement_line_forbidden "$trimmed"; then
+      echo "[comfyui-deploy] ${node_name}: ignoring requirement option: ${trimmed}" >&2
+      continue
+    fi
+    if requirement_line_is_url "$trimmed" && ! is_truthy "$allow_urls"; then
+      echo "[comfyui-deploy] ${node_name}: ignoring URL or git requirement: ${trimmed}" >&2
+      continue
+    fi
+    printf '%s\n' "$trimmed" >>"$dest"
+  done <"$src"
+}
+
+install_one_node_requirements() {
+  local node="$1" req="$2" name="$3" allow_urls="$4" constraints="$5" con_hash="$6"
+  local req_hash stamp current filtered uv_log uv_status
+  local -a only_bin=()
+  local spec pkg key
+
+  req_hash="$(sha256sum "$req" | awk '{print $1}')"
+  stamp="${node}/.mss-dep-stamp"
+  if [[ -f "$stamp" ]]; then
+    current="$(tr -d '[:space:]' <"$stamp")"
+    if [[ "$current" == "${req_hash}${con_hash}" ]]; then
+      echo "[comfyui-deploy] Custom node ${name} requirements unchanged; skipping install."
+      return 0
+    fi
+  fi
+
+  filtered="$(mktemp)"
+  filter_requirements_file "$req" "$filtered" "$name" "$allow_urls"
+  if [[ ! -s "$filtered" ]]; then
+    echo "[comfyui-deploy] Custom node ${name} has no installable requirements after filtering."
+    printf '%s %s\n' "$req_hash" "$con_hash" >"$stamp" || true
+    rm -f "$filtered"
+    return 0
+  fi
+
+  only_bin=(--only-binary torch --only-binary torchvision --only-binary torchaudio)
+  while IFS= read -r spec || [[ -n "$spec" ]]; do
+    [[ -z "$spec" || "$spec" == \#* ]] && continue
+    pkg="${spec%%==*}"
+    key="${pkg,,}"
+    if [[ "$key" == nvidia-* || "$key" == cuda-* || "$key" == triton || "$key" == triton-* ]]; then
+      only_bin+=(--only-binary "$pkg")
+    fi
+  done <"$constraints"
+
+  set +e
+  uv_log="$(uv pip install \
+    --python "${VENV_DIR}/bin/python" \
+    --constraint "$constraints" \
+    "${only_bin[@]}" \
+    -r "$filtered" 2>&1)"
+  uv_status=$?
+  set -e
+  rm -f "$filtered"
+  if [[ "$uv_status" -ne 0 ]]; then
+    echo "[comfyui-deploy] Custom node ${name} dependency install failed (exit ${uv_status}). Startup continues." >&2
+    printf '%s\n' "$uv_log" | tail -n 40 >&2
+    return 0
+  fi
+  if ! printf '%s %s\n' "$req_hash" "$con_hash" >"$stamp"; then
+    echo "[comfyui-deploy] Custom node ${name} installed, but the cache stamp could not be written." >&2
+  fi
+  echo "[comfyui-deploy] Custom node ${name} requirements installed."
+}
+
+install_custom_node_deps() {
+  local nodes_root node req name allow constraints con_hash
+  if ! is_truthy "${INSTALL_CUSTOM_NODE_DEPS:-true}"; then
+    echo "[comfyui-deploy] INSTALL_CUSTOM_NODE_DEPS is off; skipping custom-node installs."
+    return 0
+  fi
+  if [[ "$(id -u)" -ne "$COMFY_UID" ]]; then
+    echo "[comfyui-deploy] Refusing custom-node installs as uid $(id -u); they run only as uid ${COMFY_UID}." >&2
+    return 0
+  fi
+  constraints="$MSS_TORCH_CONSTRAINTS"
+  if [[ ! -f "$constraints" ]]; then
+    echo "[comfyui-deploy] Torch constraints file missing at ${constraints}; skipping custom-node installs." >&2
+    return 0
+  fi
+  con_hash="$(sha256sum "$constraints" | awk '{print $1}')"
+  nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
+  shopt -s nullglob
+  for req in "${nodes_root}"/*/requirements.txt; do
+    node="$(dirname "$req")"
+    name="$(basename "$node")"
+    [[ "$name" == .* ]] && continue
+    allow="false"
+    if [[ -n "${MSS_LOGIN_RUNTIME_DIR:-}" && "$(realpath "$node")" == "$(realpath "$MSS_LOGIN_RUNTIME_DIR")" ]]; then
+      allow="true"
+    fi
+    install_one_node_requirements "$node" "$req" "$name" "$allow" "$constraints" "$con_hash" || true
+  done
+  shopt -u nullglob
 }
 
 prepare_as_root() {
@@ -90,9 +335,6 @@ prepare_as_root() {
   ensure_owned /home/comfy/.cache/huggingface/hub
   ensure_owned /home/comfy/.cache/torch/hub
   ensure_owned /home/comfy/.bashrc file
-
-  seed_mss_login
-  ensure_owned "${NODES_DIR:-/app/ComfyUI/custom_nodes}/ComfyUI-MSS-Login"
 }
 
 require_writable() {
@@ -136,8 +378,6 @@ prepend_cuda_library_path() {
 
 launch_comfyui() {
   local detect_line
-  export MSS_DIR="${NODES_DIR:-/app/ComfyUI/custom_nodes}/ComfyUI-MSS-Login"
-
   echo "[comfyui-deploy] Initializing ComfyUI (${OS} / ${ARCH}, DEVICE_TYPE=${DEVICE_TYPE}, USE_CPU=${USE_CPU})."
 
   require_writable "${MODELS_DIR:-/app/ComfyUI/models}"
@@ -147,7 +387,7 @@ launch_comfyui() {
   require_writable /app/ComfyUI/input
   require_writable /app/ComfyUI/user
 
-  seed_mss_login
+  prepare_mss_login
 
   detect_line="$(
     python - <<'PY'
@@ -220,6 +460,8 @@ PY
   else
     echo "[comfyui-deploy] PyTorch (${TARGET_BACKEND}) already matches this host."
   fi
+
+  install_custom_node_deps
 
   if [[ "$TARGET_BACKEND" == "cpu" && "$CLI_ARGS" != *"--cpu"* ]]; then
     CLI_ARGS="${CLI_ARGS} --cpu"

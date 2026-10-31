@@ -14,21 +14,21 @@ Workflow: `.github/workflows/publish-ghcr.yml`.
 - Every run pushes `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<commit>`.
 - `push_nvidia_tag` also pushes `:nvidia`. Its default is **off**. Portainer re-pulls `:nvidia`, so leave this off until the image is ready to deploy.
 - `:latest` is refused.
-- ComfyUI-MSS-Login is fetched over HTTPS at build time. Default ref is `6f33be97315fa33997d98afc09f439b7a8fc4763` (`6f33be9`). The repo URL cannot contain credentials.
+- ComfyUI-MSS-Login is fetched over HTTPS at build time. The single pin is `MSS_LOGIN_REF`, default `1d9acbcee661088145e0adb38ab1dc829393108f` (development). The repo URL cannot contain credentials. A direct sha fetch is tried first; if that fails, the build fetches `development` and checks out that exact sha.
 
 Build args:
 
 | Arg | Default |
 |---|---|
 | `MSS_LOGIN_REPO` | `https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git` |
-| `MSS_LOGIN_REF` | `6f33be97315fa33997d98afc09f439b7a8fc4763` |
+| `MSS_LOGIN_REF` | `1d9acbcee661088145e0adb38ab1dc829393108f` |
 | `CUDA_VERSION` | `cu130` on the nvidia stage (`cu128` is the other accepted value) |
 
 `cpu`, `rocm`, and `auto` remain Dockerfile targets. Build them locally with `docker build --target cpu` (or `rocm` / `auto`). The workflow does not publish those tags.
 
 ```bash
 docker build --target nvidia \
-  --build-arg MSS_LOGIN_REF=6f33be97315fa33997d98afc09f439b7a8fc4763 \
+  --build-arg MSS_LOGIN_REF=1d9acbcee661088145e0adb38ab1dc829393108f \
   -t ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia .
 ```
 
@@ -38,7 +38,8 @@ docker build --target nvidia \
 - ComfyUI-MSS-Login at `/opt/mss-login/ComfyUI-MSS-Login` (the image seed).
 - `curl`, used by the healthcheck.
 - NVIDIA stage: PyTorch CUDA wheels and `LD_LIBRARY_PATH` pointed at the venv cuDNN/CUDA libraries (`/app/ComfyUI/.venv/lib/python3.13/site-packages/...`). This replaces `user-scripts/00-setup-uv-venv.sh`, which targeted `/root/ComfyUI/.venv`. The script is still mounted and is not executed.
-- `entrypoint.sh` copies the seed into `custom_nodes/ComfyUI-MSS-Login` only when that directory is missing or empty. An existing checkout is not modified.
+- `entrypoint.sh` seeds MSS-Login into `custom_nodes/MSS-Login` only when no copy of the package is already mounted. Detection uses the pyproject name `MSS-Login` or `mss_login.py` (`create_mss_login_middleware`), not the folder name and not the git remote. One existing copy is reused. Two copies refuse to start. The checkout HEAD must equal `/opt/mss-login/REVISION`.
+- NVIDIA stage also installs `onnxruntime-gpu` (CUDA 13 wheels, `>=1.27`), `insightface`, `onnx`, `gguf`, and `opencv-python-headless`, constrained to the baked torch/CUDA pins.
 - The container starts as root (`user: "0:0"`) so the entrypoint can `chown` root-owned volume data to uid 1000, then drops privileges with `setpriv`. A directory whose top-level owner is already 1000 is not walked again.
 
 ## Portainer
@@ -51,7 +52,35 @@ Ports: `100.65.194.86:9008` and `127.0.0.1:9008`.
 
 Watchtower labels default to `false`. That does not turn off Portainer's own re-pull of `:nvidia`.
 
-Container name is `comfyui-server`. Stack 250 used `comfyui-cuda-laptop`. ServerOps must point the Cloudflare tunnel at the new name. The compose service DNS name is still `comfyui-server`, so `http://comfyui-server:9008` is the in-network target. The tunnel container name stays `comfyui-prod-tunnel`.
+Container name is `comfyui-server`. Stack 250 used `comfyui-cuda-laptop`. ServerOps must point the Cloudflare tunnel at `http://comfyui-server:9008`. The tunnel container name stays `comfyui-prod-tunnel`, and it does not start unless the `tunnel` profile is enabled.
+
+## Cloudflare tunnel
+
+`cloudflared` is pinned to `2026.10.7` with digest `sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba` and is behind `profiles: [tunnel]`.
+
+In Portainer, open the stack environment variables and set `COMPOSE_PROFILES` to `tunnel`, then redeploy. From a shell:
+
+```bash
+COMPOSE_PROFILES=tunnel docker compose -f portainer-stack.yml up -d
+```
+
+Leave `COMPOSE_PROFILES` unset to keep the tunnel off.
+
+## MSS-Login pin
+
+The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. At startup the entrypoint runs `git -C <checkout> -c safe.directory=<checkout> rev-parse HEAD` with no network. If that sha differs, or the directory has no git HEAD, the container exits and does not modify the host checkout.
+
+`MSS_LOGIN_ALLOW_UNPINNED` defaults to false. Set it to `true` only when you intentionally run a different MSS-Login checkout, such as a development branch. The entrypoint logs a warning and continues. Rebuild with a new `MSS_LOGIN_REF` to change the pin instead of leaving the opt-out on.
+
+`MSS_LOGIN_DIR` (default `MSS-Login`) is only the folder name used when seeding a missing copy. A checkout that already lives under another folder name is reused, and the entrypoint logs that path.
+
+## Runtime custom-node dependencies
+
+After the MSS-Login seed and the torch check, uid 1000 installs each `custom_nodes/*/requirements.txt` into `/app/ComfyUI/.venv`. `INSTALL_CUSTOM_NODE_DEPS` defaults to true. A node that fails is logged, including the last lines of the installer output, and startup continues.
+
+Installs use `/opt/comfy-constraints/torch.txt`, generated in the image from the installed `torch`, `torchvision`, `torchaudio`, and `nvidia-*` / `cuda-*` wheels. Those packages are also `--only-binary`. A sha256 of the requirements file plus a sha256 of the constraints file is stored in `<node>/.mss-dep-stamp` on the custom_nodes volume, so an unchanged node is skipped on the next start.
+
+Lines that set `-i`, `--index-url`, `--extra-index-url`, `--trusted-host`, `-f`, `--find-links`, or a nested `-r` are removed and logged. `git+` and URL requirements are removed unless the file belongs to the one pinned MSS-Login checkout. Nothing in a node file can point pip at another index.
 
 `extra_model_paths.yaml` and `.bashrc` must already be files on the host. Docker creates a directory if a file bind is missing. `extra_model_paths.yaml` is mounted read-only, so the entrypoint cannot change its owner. If it is mode `600` and owned by root, make it readable by uid 1000 on the host (`chmod a+r`).
 
@@ -88,6 +117,9 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `DEVICE_TYPE` | `cuda` | `DEVICE_TYPE` |
 | `USE_CPU` | `0` | `USE_CPU` |
 | `FORCE_REINSTALL_TORCH` | `0` | `FORCE_REINSTALL_TORCH` |
+| `MSS_LOGIN_DIR` | `MSS-Login` | seed folder name; detection does not use it |
+| `INSTALL_CUSTOM_NODE_DEPS` | `true` | `INSTALL_CUSTOM_NODE_DEPS` |
+| `MSS_LOGIN_ALLOW_UNPINNED` | `false` | `MSS_LOGIN_ALLOW_UNPINNED` |
 | `CORS` | `*` | inside `CLI_ARGS` |
 | `VRAM_RESERVE_GB` | `1.5` | inside `CLI_ARGS` (`--reserve-vram`) |
 | `FRONTEND_VERSION` | `latest` | inside `CLI_ARGS` (`--front-end-version`) |

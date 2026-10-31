@@ -6,6 +6,7 @@
 #
 # Container name is comfyui-server (stack 250 ran comfyui-cuda-laptop).
 # Point the Cloudflare tunnel at http://comfyui-server:9008.
+# cloudflared is off unless COMPOSE_PROFILES=tunnel.
 #
 # CPU limits from stack 256: 8 maximum, 4 reserved.
 # The process starts as root so root-owned volume files can be chowned to
@@ -86,6 +87,11 @@ services:
       DEVICE_TYPE: ${DEVICE_TYPE:-cuda}
       USE_CPU: ${USE_CPU:-0}
       FORCE_REINSTALL_TORCH: ${FORCE_REINSTALL_TORCH:-0}
+      # Seed folder only. An existing package named MSS-Login is reused
+      # whatever directory it lives in.
+      MSS_LOGIN_DIR: ${MSS_LOGIN_DIR:-MSS-Login}
+      INSTALL_CUSTOM_NODE_DEPS: ${INSTALL_CUSTOM_NODE_DEPS:-true}
+      MSS_LOGIN_ALLOW_UNPINNED: ${MSS_LOGIN_ALLOW_UNPINNED:-false}
     volumes:
       - ${COMFYUI_USER_SCRIPTS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/user-scripts}:/home/comfy/user-scripts:rw
       - ${COMFYUI_MODELS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/models}:/app/ComfyUI/models:rw
@@ -119,8 +125,12 @@ services:
               count: all
               capabilities: ["gpu"]
 
+  # Opt-in. In Portainer, set stack environment variable COMPOSE_PROFILES=tunnel.
+  # Without that profile this service is not created.
   comfyui-prod-tunnel:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.10.7@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
+    profiles:
+      - tunnel
     restart: always
     container_name: comfyui-prod-tunnel
     command: tunnel --no-autoupdate --protocol http2 run

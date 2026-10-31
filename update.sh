@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Manual in-container updater for ComfyUI core and PyTorch wheels.
-# Does not fetch, reset, or overwrite ComfyUI-MSS-Login. Replace that pin by
+# Does not fetch, reset, or overwrite MSS-Login. Replace that pin by
 # building a new image. If docker exec starts this script as root, it drops
 # to uid 1000 before writing into the venv.
 set -euo pipefail
@@ -16,7 +16,22 @@ ARCH="$(uname -m)"
 OS="$(uname -s)"
 VENV_DIR="${VIRTUAL_ENV:-/app/ComfyUI/.venv}"
 STAMP_FILE="${VENV_DIR}/.mss_torch_backend"
-export MSS_DIR="${NODES_DIR:-/app/ComfyUI/custom_nodes}/ComfyUI-MSS-Login"
+# shellcheck source=entrypoint.sh
+source "$(dirname "$(readlink -f "$0")")/entrypoint.sh"
+nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
+mss_found=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && mss_found+=("$line")
+done < <(discover_mss_login_dirs "$nodes_root")
+if ((${#mss_found[@]} > 1)); then
+  echo "[comfyui-deploy] Refusing to update: ${#mss_found[@]} MSS-Login copies are present." >&2
+  exit 1
+fi
+if ((${#mss_found[@]} == 1)); then
+  export MSS_DIR="${mss_found[0]}"
+else
+  export MSS_DIR="${nodes_root}/${MSS_LOGIN_DIR:-MSS-Login}"
+fi
 
 echo "[comfyui-deploy] MSS-Login at ${MSS_DIR} is left as-is."
 echo "[comfyui-deploy] Checking for ComfyUI updates via comfy-cli (${OS} / ${ARCH})..."

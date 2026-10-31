@@ -1,6 +1,8 @@
 # ComfyUI runtime. ComfyUI-MSS-Login is not in this repository; the image
-# fetches it over HTTPS at build time. The default pin is commit 6f33be9
-# (6f33be97315fa33997d98afc09f439b7a8fc4763).
+# fetches it over HTTPS at build time. The single pin is MSS_LOGIN_REF
+# (development 1d9acbcee661088145e0adb38ab1dc829393108f). The full sha is
+# written to /opt/mss-login/REVISION and the entrypoint refuses a checkout
+# whose HEAD differs.
 # https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login
 #
 # Targets: cpu, nvidia, rocm, auto. The GitHub workflow publishes nvidia only.
@@ -8,7 +10,7 @@
 FROM ubuntu:24.04 AS base
 
 ARG MSS_LOGIN_REPO=https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
-ARG MSS_LOGIN_REF=6f33be97315fa33997d98afc09f439b7a8fc4763
+ARG MSS_LOGIN_REF=1d9acbcee661088145e0adb38ab1dc829393108f
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -62,8 +64,11 @@ RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
     fi \
     && git init --quiet ComfyUI-MSS-Login \
     && git -C ComfyUI-MSS-Login remote add origin "${MSS_LOGIN_REPO}" \
-    && GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch --depth 1 origin "${MSS_LOGIN_REF}" \
-    && git -C ComfyUI-MSS-Login checkout --detach FETCH_HEAD \
+    && if ! GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch --depth 1 origin "${MSS_LOGIN_REF}"; then \
+      echo "Direct fetch of ${MSS_LOGIN_REF} failed; fetching development and checking out that sha." >&2; \
+      GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch origin development; \
+    fi \
+    && git -C ComfyUI-MSS-Login checkout --detach "${MSS_LOGIN_REF}" \
     && got="$(git -C ComfyUI-MSS-Login rev-parse HEAD)" \
     && if [[ "${got}" != "${MSS_LOGIN_REF}"* ]]; then \
       echo "checked out ${got}, wanted ${MSS_LOGIN_REF}" >&2; \
@@ -75,6 +80,7 @@ RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
 
 COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
 COPY --chmod=755 update.sh /app/update.sh
+COPY --chmod=755 scripts/write-torch-constraints.sh /app/write-torch-constraints.sh
 
 RUN mkdir -p \
         /data/mss-login \
@@ -91,7 +97,9 @@ RUN mkdir -p \
         /home/comfy/.cache/huggingface/hub \
         /home/comfy/.cache/torch/hub \
         /home/comfy/user-scripts \
-    && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/mss-login /opt/uv-python /opt/uv-tools
+        /opt/comfy-constraints \
+    && /app/write-torch-constraints.sh \
+    && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/mss-login /opt/uv-python /opt/uv-tools /opt/comfy-constraints
 
 LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
       org.opencontainers.image.title="comfyui-mss-login" \
@@ -115,6 +123,7 @@ RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --index-url https://download.pytorch.org/whl/cpu \
         torch torchvision torchaudio \
     && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && /app/write-torch-constraints.sh \
     && rm -rf /tmp/uv-cache
 
 FROM base AS nvidia
@@ -124,6 +133,10 @@ ARG CUDA_VERSION=cu130
 # (/app/ComfyUI/.venv, Debian lib/, no system CUDA prefix). Venv wheels come
 # first so a system cuDNN cannot shadow them. user-scripts/00-setup-uv-venv.sh
 # is not used; that script addresses the old /root/ComfyUI/.venv layout.
+# onnxruntime-gpu>=1.27 publishes CUDA 13 / cuDNN 9 wheels by default, which
+# matches this stage. insightface, gguf, and opencv-python-headless are the
+# heavy pieces used by IPAdapter, InstantID, and GGUF nodes. The CPU
+# onnxruntime distribution is removed if insightface pulls it in.
 ENV DEVICE_TYPE=cuda \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
@@ -137,6 +150,18 @@ RUN case "${CUDA_VERSION}" in \
         --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" \
         torch torchvision torchaudio \
     && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && /app/write-torch-constraints.sh \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
+        --constraint /opt/comfy-constraints/torch.txt \
+        --only-binary torch,torchvision,torchaudio,onnxruntime-gpu,onnx,gguf,opencv-python-headless \
+        "onnxruntime-gpu>=1.27" \
+        onnx \
+        insightface \
+        gguf \
+        opencv-python-headless \
+    && if uv pip show --python /app/ComfyUI/.venv/bin/python onnxruntime >/dev/null 2>&1; then \
+      uv pip uninstall --python /app/ComfyUI/.venv/bin/python onnxruntime; \
+    fi \
     && rm -rf /tmp/uv-cache
 
 FROM base AS rocm
@@ -147,6 +172,7 @@ RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --index-url "https://download.pytorch.org/whl/${ROCM_VERSION}" \
         torch torchvision torchaudio \
     && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && /app/write-torch-constraints.sh \
     && rm -rf /tmp/uv-cache
 
 FROM base AS auto

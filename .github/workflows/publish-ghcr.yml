@@ -20,19 +20,21 @@ on:
         type: string
         default: "cu130"
       mss_login_ref:
-        description: "ComfyUI-MSS-Login commit SHA fetched over HTTPS. Default is 6f33be9."
+        description: "ComfyUI-MSS-Login commit SHA fetched over HTTPS. Default is development 1d9acbcee661088145e0adb38ab1dc829393108f."
         type: string
-        default: "6f33be97315fa33997d98afc09f439b7a8fc4763"
+        default: "1d9acbcee661088145e0adb38ab1dc829393108f"
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   publish:
     name: Build and push
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
     env:
       PUSH_NVIDIA_TAG: ${{ inputs.push_nvidia_tag }}
       EXTRA_TAG: ${{ inputs.tag }}
@@ -40,7 +42,8 @@ jobs:
       MSS_LOGIN_REF: ${{ inputs.mss_login_ref }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # actions/checkout@v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Resolve image tags
         id: tags
@@ -107,17 +110,20 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        # docker/setup-buildx-action@v3.12.0
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        # docker/login-action@v3.7.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
       - name: Build and push nvidia target
-        uses: docker/build-push-action@v6
+        # docker/build-push-action@v6.19.2
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: Dockerfile
