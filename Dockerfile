@@ -81,6 +81,7 @@ RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
 COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
 COPY --chmod=755 update.sh /app/update.sh
 COPY --chmod=755 scripts/write-torch-constraints.sh /app/write-torch-constraints.sh
+COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
 
 RUN mkdir -p \
         /data/mss-login \
@@ -99,6 +100,7 @@ RUN mkdir -p \
         /home/comfy/user-scripts \
         /opt/comfy-constraints \
     && /app/write-torch-constraints.sh \
+    && cp /opt/mss-login/REVISION /app/ComfyUI/.venv/.mss-build-id \
     && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/mss-login /opt/uv-python /opt/uv-tools /opt/comfy-constraints
 
 LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
@@ -153,12 +155,12 @@ RUN case "${CUDA_VERSION}" in \
     && /app/write-torch-constraints.sh \
     && uv pip install --python /app/ComfyUI/.venv/bin/python \
         --constraint /opt/comfy-constraints/torch.txt \
-        --only-binary torch,torchvision,torchaudio,onnxruntime-gpu,onnx,gguf,opencv-python-headless \
-        "onnxruntime-gpu>=1.27" \
-        onnx \
-        insightface \
-        gguf \
-        opencv-python-headless \
+        --only-binary torch,torchvision,torchaudio,onnxruntime-gpu,onnx,gguf,opencv-python-headless,insightface \
+        "onnxruntime-gpu==1.31.1" \
+        "onnx==1.23.2" \
+        "insightface==2.1" \
+        "gguf==0.19.0" \
+        "opencv-python-headless==5.0.0.93" \
     && if uv pip show --python /app/ComfyUI/.venv/bin/python onnxruntime >/dev/null 2>&1; then \
       uv pip uninstall --python /app/ComfyUI/.venv/bin/python onnxruntime; \
     fi \

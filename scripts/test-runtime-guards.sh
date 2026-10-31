@@ -6,6 +6,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${root}/entrypoint.sh"
+export MSS_LOGIN_TEST_MODE=1
 
 fail() {
   echo "FAIL: $*" >&2
@@ -62,27 +63,56 @@ EOF
   if grep -E -q 'extra-index-url|trusted-host|find-links|git\+|example.com' "$dest"; then
     fail "filtered file still has a supply-chain line: $(cat "$dest")"
   fi
-  grep -q 'ignoring requirement option: --extra-index-url' "$err" || fail "did not log extra-index-url"
-  grep -q 'ignoring requirement option: -i ' "$err" || fail "did not log -i"
-  grep -q 'ignoring requirement option: --trusted-host' "$err" || fail "did not log trusted-host"
-  grep -q 'ignoring URL or git requirement: git+https://' "$err" || fail "did not log git+"
-  filter_requirements_file "$src" "$dest" "MSS-Login" true 2>"$err"
-  grep -qx 'git+https://github.com/example/pkg.git' "$dest" || fail "pinned MSS-Login should keep git+ lines"
+  grep -q 'ignoring requirement line: --extra-index-url' "$err" || fail "did not log extra-index-url"
+  grep -q 'ignoring requirement line: -i ' "$err" || fail "did not log -i"
+  grep -q 'ignoring requirement line: --trusted-host' "$err" || fail "did not log trusted-host"
+  grep -q 'ignoring requirement line: git+https://' "$err" || fail "did not log git+"
+  if grep -q 'git+' "$dest"; then
+    fail "URL requirements must be dropped even for MSS-Login"
+  fi
+  {
+    printf '%s\n' \
+      '-ihttp://127.0.0.1:9/evil-i' \
+      '-fhttp://127.0.0.1:9/evil-f' \
+      '-r/tmp/evilr.txt' \
+      '-c /tmp/evilc.txt' \
+      '--constraint /tmp/evilc.txt' \
+      '-c/tmp/evilc.txt' \
+      '-e /tmp/localpkg' \
+      '/tmp/localpkg' \
+      'localpkg @ file:///tmp/localpkg' \
+      'six @ http://127.0.0.1:9/six.whl' \
+      '--INDEX-URL http://127.0.0.1:9/evil-upper' \
+      '--index-url=http://127.0.0.1:9/evil-eq' \
+      '--no-index'
+    printf '%s\n' $'--extra-\\\nindex-url http://127.0.0.1:9/evil-cont'
+    printf '%s\n' $'\t--extra-index-url\thttp://127.0.0.1:9/evil-tab'
+    printf '%s\r\n' '--index-url http://127.0.0.1:9/evil-crlf'
+    printf '%s\n' 'six'
+  } >"$src"
+  filter_requirements_file "$src" "$dest" "Demo" false 2>"$err"
+  assert_eq "$(grep -vx six "$dest" || true)" "" "adversarial lines must not be kept"
+  grep -qx six "$dest" || fail "six was dropped"
   rm -f "$src" "$dest" "$err"
   echo "filter case passed"
 }
 
 cache_case() {
-  local base nodes constraints bin log node
+  local base nodes constraints bin log node allow venv
   base="$(new_case)"
   nodes="${base}/custom_nodes"
   constraints="${base}/torch.txt"
+  allow="${base}/allow.txt"
+  venv="${base}/venv"
   bin="${base}/bin"
   log="${base}/uv.log"
-  node="${nodes}/SomeNode"
-  mkdir -p "$node" "$bin"
+  node="${nodes}/ComfyUI-GGUF"
+  mkdir -p "$node" "${nodes}/NotListed" "$bin" "$venv"
   printf 'numpy>=1.0\n' >"${node}/requirements.txt"
+  printf 'numpy>=1.0\n' >"${nodes}/NotListed/requirements.txt"
   printf 'torch==2.9.0\n' >"$constraints"
+  printf 'ComfyUI-GGUF\n' >"$allow"
+  printf 'build-1\n' >"${venv}/.mss-build-id"
   cat >"${bin}/uv" <<EOF
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "${log}"
@@ -92,22 +122,30 @@ EOF
   PATH="${bin}:${PATH}" \
     NODES_DIR="$nodes" \
     MSS_TORCH_CONSTRAINTS="$constraints" \
+    MSS_NODE_DEPS_ALLOWLIST="$allow" \
+    MSS_TEST_VENV_DIR="$venv" \
     MSS_LOGIN_RUNTIME_DIR="" \
     install_custom_node_deps
   assert_eq "$(wc -l <"$log" | tr -d ' ')" "1" "first install calls uv once"
+  [[ -f "${venv}/.mss-node-dep-stamps/ComfyUI-GGUF" ]] || fail "stamp was not stored in the venv"
+  [[ ! -e "${node}/.mss-dep-stamp" ]] || fail "stamp leaked onto the custom node"
   PATH="${bin}:${PATH}" \
     NODES_DIR="$nodes" \
     MSS_TORCH_CONSTRAINTS="$constraints" \
+    MSS_NODE_DEPS_ALLOWLIST="$allow" \
+    MSS_TEST_VENV_DIR="$venv" \
     MSS_LOGIN_RUNTIME_DIR="" \
     install_custom_node_deps
   assert_eq "$(wc -l <"$log" | tr -d ' ')" "1" "unchanged requirements skip uv"
-  printf 'numpy>=2.0\n' >"${node}/requirements.txt"
+  printf 'build-2\n' >"${venv}/.mss-build-id"
   PATH="${bin}:${PATH}" \
     NODES_DIR="$nodes" \
     MSS_TORCH_CONSTRAINTS="$constraints" \
+    MSS_NODE_DEPS_ALLOWLIST="$allow" \
+    MSS_TEST_VENV_DIR="$venv" \
     MSS_LOGIN_RUNTIME_DIR="" \
     install_custom_node_deps
-  assert_eq "$(wc -l <"$log" | tr -d ' ')" "2" "changed requirements install again"
+  assert_eq "$(wc -l <"$log" | tr -d ' ')" "2" "new image build id reinstalls"
   rm -rf "$base"
   echo "cache case passed"
 }
@@ -163,7 +201,7 @@ different_folder_case() {
 }
 
 remote_only_case() {
-  local base seed nodes rev sha decoy
+  local base seed nodes rev decoy status log
   base="$(new_case)"
   seed="${base}/seed"
   nodes="${base}/custom_nodes"
@@ -178,16 +216,22 @@ remote_only_case() {
   git -C "$decoy" commit -q -m decoy
   git -C "$decoy" remote add origin https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
   make_plugin "$seed"
-  sha="$(git -C "$seed" rev-parse HEAD)"
-  printf '%s\n' "$sha" >"$rev"
-  MSS_LOGIN_SEED="$seed" \
-    MSS_LOGIN_REVISION_FILE="$rev" \
-    NODES_DIR="$nodes" \
-    MSS_LOGIN_DIR="MSS-Login" \
-    MSS_LOGIN_ALLOW_UNPINNED="false" \
-    prepare_mss_login
-  [[ -f "${nodes}/MSS-Login/mss_login.py" ]] || fail "remote-only directory suppressed seeding"
-  [[ -f "${decoy}/README.md" ]] || fail "remote-only directory was overwritten"
+  printf '%s\n' "$(git -C "$seed" rev-parse HEAD)" >"$rev"
+  log="$(mktemp)"
+  set +e
+  (
+    MSS_LOGIN_SEED="$seed" \
+      MSS_LOGIN_REVISION_FILE="$rev" \
+      NODES_DIR="$nodes" \
+      MSS_LOGIN_DIR="MSS-Login" \
+      prepare_mss_login
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "git remote alone was allowed to sit beside a seeded copy"
+  [[ ! -e "${nodes}/MSS-Login" ]] || fail "seeded a second copy beside a remote match"
+  grep -q 'Refusing' "$log" || fail "remote-only refusal missing"
+  rm -f "$log"
   rm -rf "$base"
   echo "remote-only case passed"
 }
@@ -213,6 +257,66 @@ two_copies_case() {
   rm -f "$log"
   rm -rf "$base"
   echo "two copies case passed"
+}
+
+attack_cases() {
+  local base seed nodes rev sha status log
+  base="$(new_case)"
+  seed="${base}/seed"
+  nodes="${base}/custom_nodes"
+  rev="${base}/REVISION"
+  mkdir -p "$nodes"
+  make_plugin "$seed"
+  sha="$(git -C "$seed" rev-parse HEAD)"
+  printf '%s\n' "$sha" >"$rev"
+
+  run_prepare() {
+    local label="$1"
+    shift
+    log="$(mktemp)"
+    set +e
+    (
+      MSS_LOGIN_SEED="$seed" MSS_LOGIN_REVISION_FILE="$rev" NODES_DIR="$nodes" MSS_LOGIN_DIR="MSS-Login" prepare_mss_login
+    ) >"$log" 2>&1
+    status=$?
+    set -e
+    if [[ "$1" == "ok" ]]; then
+      [[ "$status" -eq 0 ]] || fail "${label} should start: $(cat "$log")"
+    else
+      [[ "$status" -ne 0 ]] || fail "${label} should refuse: $(cat "$log")"
+      grep -q 'Refusing' "$log" || fail "${label} missing Refusing: $(cat "$log")"
+    fi
+    rm -f "$log"
+  }
+
+  rm -rf "$nodes"
+  mkdir -p "$nodes"
+  cp -a "$seed" "${nodes}/MSS-Login"
+  run_prepare "clean copy" ok
+
+  echo 'print("backdoor")' >>"${nodes}/MSS-Login/mss_login.py"
+  run_prepare "dirty file" bad
+  git -C "${nodes}/MSS-Login" checkout -q -- mss_login.py
+
+  echo 'x=1' >"${nodes}/MSS-Login/extra_evil.py"
+  run_prepare "untracked file" bad
+  rm -f "${nodes}/MSS-Login/extra_evil.py"
+
+  rm -rf "${nodes}/MSS-Login/.git"
+  git -C "${nodes}/MSS-Login" init -q
+  printf '%s\n' "$sha" >"${nodes}/MSS-Login/.git/HEAD"
+  run_prepare "forged HEAD" bad
+
+  rm -rf "$nodes"
+  mkdir -p "$nodes"
+  cp -a "$seed" "${nodes}/Altered"
+  sed -i 's/^name = "MSS-Login"/name = "Not-It"/' "${nodes}/Altered/pyproject.toml"
+  mv "${nodes}/Altered/mss_login.py" "${nodes}/Altered/core.py"
+  run_prepare "renamed entry module" bad
+  [[ ! -e "${nodes}/MSS-Login" ]] || fail "altered copy caused a second seed"
+
+  rm -rf "$base"
+  echo "attack cases passed"
 }
 
 mismatch_case() {
@@ -267,4 +371,5 @@ different_folder_case
 remote_only_case
 two_copies_case
 mismatch_case
+attack_cases
 echo "all runtime guard tests passed"

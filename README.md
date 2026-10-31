@@ -68,19 +68,37 @@ Leave `COMPOSE_PROFILES` unset to keep the tunnel off.
 
 ## MSS-Login pin
 
-The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. At startup the entrypoint runs `git -C <checkout> -c safe.directory=<checkout> rev-parse HEAD` with no network. If that sha differs, or the directory has no git HEAD, the container exits and does not modify the host checkout.
+The image revision is the full `MSS_LOGIN_REF` sha written to `/opt/mss-login/REVISION`. Startup accepts a host copy only when all of these hold:
 
-`MSS_LOGIN_ALLOW_UNPINNED` defaults to false. Set it to `true` only when you intentionally run a different MSS-Login checkout, such as a development branch. The entrypoint logs a warning and continues. Rebuild with a new `MSS_LOGIN_REF` to change the pin instead of leaving the opt-out on.
+- `diff -rq --exclude=.git --exclude=__pycache__ --exclude='*.pyc' --no-dereference` against `/opt/mss-login/ComfyUI-MSS-Login` is empty
+- `git rev-parse --show-toplevel` is that directory, not a parent repo
+- `git cat-file -e <revision>^{commit}` succeeds and `HEAD` is that commit
+- `git status --porcelain --untracked-files=all` is empty
 
-`MSS_LOGIN_DIR` (default `MSS-Login`) is only the folder name used when seeding a missing copy. A checkout that already lives under another folder name is reused, and the entrypoint logs that path.
+A dirty file, an untracked file, a forged `.git/HEAD` with no commit object, or a renamed-but-edited tree refuses to start. The host files are not overwritten. A second copy, including one found by a baked file hash or by a git remote of `ComfyUI-MSS-Login`, also refuses to start.
+
+`MSS_LOGIN_DIR` (default `MSS-Login`) is only the folder used when nothing matches. An exact copy under another folder name is reused.
+
+There is no stack variable to disable the pin. Emergency only, for one container start:
+
+- create the file `MSS_LOGIN_BREAK_GLASS` inside the MSS-Login data directory (`/data/mss-login` in the container, the `mss-data` host mount), or
+- `docker run -e MSS_LOGIN_ALLOW_UNPINNED=true` for a one-off process
+
+Do not add that variable to the Portainer stack. Rebuild with a new `MSS_LOGIN_REF` to change what is allowed to run.
 
 ## Runtime custom-node dependencies
 
-After the MSS-Login seed and the torch check, uid 1000 installs each `custom_nodes/*/requirements.txt` into `/app/ComfyUI/.venv`. `INSTALL_CUSTOM_NODE_DEPS` defaults to true. A node that fails is logged, including the last lines of the installer output, and startup continues.
+`INSTALL_CUSTOM_NODE_DEPS` defaults to true. Only directories whose names appear, exactly, in `config/custom-node-deps-allowlist.txt` are installed. Every other `requirements.txt` is logged and skipped. MSS-Login is never installed at runtime; its resolved packages are pinned in `/opt/comfy-constraints/torch.txt` at build time together with torch and the CUDA wheels.
 
-Installs use `/opt/comfy-constraints/torch.txt`, generated in the image from the installed `torch`, `torchvision`, `torchaudio`, and `nvidia-*` / `cuda-*` wheels. Those packages are also `--only-binary`. A sha256 of the requirements file plus a sha256 of the constraints file is stored in `<node>/.mss-dep-stamp` on the custom_nodes volume, so an unchanged node is skipped on the next start.
+Stamps live in the venv (`.mss-node-dep-stamps`) and include the image revision, the constraints hash, and `/app/ComfyUI/.venv/.mss-build-id`, so a new image reinstalls.
 
-Lines that set `-i`, `--index-url`, `--extra-index-url`, `--trusted-host`, `-f`, `--find-links`, or a nested `-r` are removed and logged. `git+` and URL requirements are removed unless the file belongs to the one pinned MSS-Login checkout. Nothing in a node file can point pip at another index.
+Requirement lines that are options, nested includes, editable installs, local paths, or any URL are dropped and logged. Installs use PyPI only, as uid 1000.
+
+`comfyui_ryanonyheinside` and `comfyui-supir` have a `requirements.txt` but no verifiable git remote, so they are not on the allowlist. Workflows that import them will fail until that list is updated.
+
+## InsightFace buffalo_l
+
+The image does not download InsightFace models. Mount a tree you have already verified at `/mnt/tmd-secure/Data/Docker/ComfyUI/insightface` (`INSIGHTFACE_HOME=/home/comfy/.insightface`). `buffalo_l` belongs at `models/buffalo_l` inside that directory. The usual upstream archive is `https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip`; check its checksum before unpacking it on the host.
 
 `extra_model_paths.yaml` and `.bashrc` must already be files on the host. Docker creates a directory if a file bind is missing. `extra_model_paths.yaml` is mounted read-only, so the entrypoint cannot change its owner. If it is mode `600` and owned by root, make it readable by uid 1000 on the host (`chmod a+r`).
 
@@ -119,7 +137,7 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `FORCE_REINSTALL_TORCH` | `0` | `FORCE_REINSTALL_TORCH` |
 | `MSS_LOGIN_DIR` | `MSS-Login` | seed folder name; detection does not use it |
 | `INSTALL_CUSTOM_NODE_DEPS` | `true` | `INSTALL_CUSTOM_NODE_DEPS` |
-| `MSS_LOGIN_ALLOW_UNPINNED` | `false` | `MSS_LOGIN_ALLOW_UNPINNED` |
+| `COMFYUI_INSIGHTFACE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/insightface` | host path for a verified buffalo_l tree |
 | `CORS` | `*` | inside `CLI_ARGS` |
 | `VRAM_RESERVE_GB` | `1.5` | inside `CLI_ARGS` (`--reserve-vram`) |
 | `FRONTEND_VERSION` | `latest` | inside `CLI_ARGS` (`--front-end-version`) |

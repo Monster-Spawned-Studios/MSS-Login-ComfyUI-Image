@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # Container entrypoint.
 # Starts as root only long enough to give uid 1000 ownership of root-owned
-# volume data, then drops privileges. MSS-Login is detected by its package
-# (pyproject name or mss_login.py), never by folder name alone. An existing
-# checkout is never overwritten. Its git HEAD must match /opt/mss-login/REVISION
-# unless MSS_LOGIN_ALLOW_UNPINNED is set.
-# Custom-node requirements are installed as uid 1000, constrained to the torch
-# and CUDA wheels baked into the image.
+# volume data, then drops privileges. A host MSS-Login tree is accepted only
+# when its files match the image copy and its git checkout is the baked
+# revision with a clean status. Custom-node requirements are installed only
+# for names in the baked allowlist, as uid 1000, under image constraints.
 set -euo pipefail
 
 COMFY_UID=1000
@@ -19,8 +17,55 @@ ARCH="$(uname -m)"
 OS="$(uname -s)"
 VENV_DIR="${VIRTUAL_ENV:-/app/ComfyUI/.venv}"
 STAMP_FILE="${VENV_DIR}/.mss_torch_backend"
-MSS_TORCH_CONSTRAINTS="${MSS_TORCH_CONSTRAINTS:-/opt/comfy-constraints/torch.txt}"
-MSS_LOGIN_REVISION_FILE="${MSS_LOGIN_REVISION_FILE:-/opt/mss-login/REVISION}"
+
+# Production paths are fixed. Tests set MSS_LOGIN_TEST_MODE=1 to redirect them.
+mss_login_revision_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_LOGIN_REVISION_FILE:-}" ]]; then
+    printf '%s\n' "$MSS_LOGIN_REVISION_FILE"
+  else
+    printf '%s\n' "/opt/mss-login/REVISION"
+  fi
+}
+
+mss_login_baked_root() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_LOGIN_SEED:-}" ]]; then
+    printf '%s\n' "$MSS_LOGIN_SEED"
+  else
+    printf '%s\n' "/opt/mss-login/ComfyUI-MSS-Login"
+  fi
+}
+
+mss_torch_constraints_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_TORCH_CONSTRAINTS:-}" ]]; then
+    printf '%s\n' "$MSS_TORCH_CONSTRAINTS"
+  else
+    printf '%s\n' "/opt/comfy-constraints/torch.txt"
+  fi
+}
+
+mss_node_allowlist_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_NODE_DEPS_ALLOWLIST:-}" ]]; then
+    printf '%s\n' "$MSS_NODE_DEPS_ALLOWLIST"
+  else
+    printf '%s\n' "/opt/mss-login/custom-node-deps-allowlist.txt"
+  fi
+}
+
+mss_build_id_file() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_TEST_VENV_DIR:-}" ]]; then
+    printf '%s\n' "${MSS_TEST_VENV_DIR}/.mss-build-id"
+  else
+    printf '%s\n' "${VENV_DIR}/.mss-build-id"
+  fi
+}
+
+mss_stamp_dir() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_TEST_VENV_DIR:-}" ]]; then
+    printf '%s\n' "${MSS_TEST_VENV_DIR}/.mss-node-dep-stamps"
+  else
+    printf '%s\n' "${VENV_DIR}/.mss-node-dep-stamps"
+  fi
+}
 
 is_truthy() {
   local value="${1:-}"
@@ -66,14 +111,77 @@ ensure_owned() {
   chown -R "${COMFY_UID}:${COMFY_GID}" "$path"
 }
 
-# Primary detection: pyproject package name or the plugin entry module.
-# A git remote is not sufficient on its own.
+# Package name or the plugin entry module. Folder name is not consulted.
 is_mss_login_tree() {
   local dir="$1"
+  [[ -e "$dir" ]] || return 1
   if [[ -f "${dir}/pyproject.toml" ]] && grep -E -q '^[[:space:]]*name[[:space:]]*=[[:space:]]*["'\'']MSS-Login["'\''][[:space:]]*$' "${dir}/pyproject.toml"; then
     return 0
   fi
   if [[ -f "${dir}/mss_login.py" ]] && grep -q 'create_mss_login_middleware' "${dir}/mss_login.py"; then
+    return 0
+  fi
+  return 1
+}
+
+declare -gA MSS_FP_HASHES=()
+
+load_mss_login_fingerprints() {
+  local root file hash
+  MSS_FP_HASHES=()
+  root="$(mss_login_baked_root)"
+  [[ -d "$root" ]] || return 0
+  while IFS= read -r file; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    hash="$(sha256sum "$file" | awk '{print $1}')"
+    MSS_FP_HASHES["$hash"]=1
+  done < <(find -P "$root" \
+    \( -name .git -o -name __pycache__ -o -name docs -o -name readme -o -name .github \) -prune -o \
+    -type f ! -name '*.pyc' ! -name 'README*' ! -name 'LICENSE*' -size +0c -print)
+}
+
+git_remote_matches_mss_login() {
+  local dir="$1"
+  local canon top url
+  [[ -e "$dir" ]] || return 1
+  canon="$(realpath "$dir")"
+  top="$(git -C "$canon" -c safe.directory="$canon" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$top" ]] || return 1
+  top="$(realpath "$top")"
+  [[ "$top" == "$canon" ]] || return 1
+  url="$(git -C "$canon" -c safe.directory="$canon" remote get-url origin 2>/dev/null || true)"
+  [[ "$url" == *ComfyUI-MSS-Login* || "$url" == *"/MSS-Login"* || "$url" == *":MSS-Login"* ]]
+}
+
+dir_has_baked_file() {
+  local dir="$1"
+  local file hash
+  [[ -d "$dir" ]] || return 1
+  [[ "${#MSS_FP_HASHES[@]}" -gt 0 ]] || return 1
+  while IFS= read -r file; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    hash="$(sha256sum "$file" | awk '{print $1}')"
+    if [[ -n "${MSS_FP_HASHES[$hash]:-}" ]]; then
+      return 0
+    fi
+  done < <(find -P "$dir" \( -name .git -o -name __pycache__ \) -prune -o -type f ! -name '*.pyc' -print)
+  return 1
+}
+
+dir_has_mss_login_signal() {
+  local dir="$1"
+  local target="$dir"
+  if [[ -L "$dir" ]]; then
+    target="$(realpath "$dir" 2>/dev/null || true)"
+    [[ -n "$target" ]] || return 1
+  fi
+  if is_mss_login_tree "$target"; then
+    return 0
+  fi
+  if git_remote_matches_mss_login "$target"; then
+    return 0
+  fi
+  if dir_has_baked_file "$target"; then
     return 0
   fi
   return 1
@@ -88,7 +196,7 @@ discover_mss_login_dirs() {
     [[ -d "$dir" ]] || continue
     name="$(basename "$dir")"
     [[ "$name" == .* ]] && continue
-    if is_mss_login_tree "$dir"; then
+    if dir_has_mss_login_signal "$dir"; then
       printf '%s\n' "$dir"
     fi
   done
@@ -121,37 +229,73 @@ seed_mss_login_into() {
   cp -a "${seed}/." "${dest}/"
 }
 
-enforce_mss_login_pin() {
-  local dir="$1"
-  local expected="" actual="" canon
-  if [[ ! -f "$MSS_LOGIN_REVISION_FILE" ]]; then
-    echo "[comfyui-deploy] Image pin file ${MSS_LOGIN_REVISION_FILE} is missing." >&2
-    exit 1
+mss_login_break_glass() {
+  if [[ -f "${MSS_LOGIN_DATA_DIR:-/data/mss-login}/MSS_LOGIN_BREAK_GLASS" ]]; then
+    return 0
   fi
-  expected="$(tr -d '[:space:]' <"$MSS_LOGIN_REVISION_FILE")"
-  expected="${expected,,}"
+  if is_truthy "${MSS_LOGIN_ALLOW_UNPINNED:-false}"; then
+    return 0
+  fi
+  return 1
+}
+
+# Content plus a real commit. HEAD text alone is not enough.
+exact_mss_login_copy() {
+  local dir="$1"
+  local baked expected actual canon top status
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
   canon="$(realpath "$dir")"
+  baked="$(mss_login_baked_root)"
+  [[ -d "$baked" ]] || return 1
+  if ! diff -rq --exclude=.git --exclude=__pycache__ --exclude='*.pyc' --no-dereference "$baked" "$canon" >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ ! -f "$(mss_login_revision_file)" ]]; then
+    return 1
+  fi
+  expected="$(tr -d '[:space:]' <"$(mss_login_revision_file)")"
+  expected="${expected,,}"
+  [[ -n "$expected" ]] || return 1
+  if ! top="$(git -C "$canon" -c safe.directory="$canon" rev-parse --show-toplevel 2>/dev/null)"; then
+    return 1
+  fi
+  top="$(realpath "$top")"
+  [[ "$top" == "$canon" ]] || return 1
+  if ! git -C "$canon" -c safe.directory="$canon" cat-file -e "${expected}^{commit}" 2>/dev/null; then
+    return 1
+  fi
   if ! actual="$(git -C "$canon" -c safe.directory="$canon" rev-parse HEAD 2>/dev/null)"; then
-    actual=""
+    return 1
   fi
   actual="$(printf '%s' "$actual" | tr -d '[:space:]')"
   actual="${actual,,}"
-  if [[ -n "$actual" && "$actual" == "$expected" ]]; then
-    echo "[comfyui-deploy] MSS-Login at ${canon} matches image pin ${expected}."
-    return 0
+  [[ "$actual" == "$expected" ]] || return 1
+  status="$(git -C "$canon" -c safe.directory="$canon" status --porcelain --untracked-files=all 2>/dev/null || true)"
+  [[ -z "$status" ]] || return 1
+  return 0
+}
+
+log_pin_facts() {
+  local dir="$1"
+  local expected="" actual="" canon
+  [[ -e "$dir" ]] || return 0
+  canon="$(realpath "$dir")"
+  if [[ -f "$(mss_login_revision_file)" ]]; then
+    expected="$(tr -d '[:space:]' <"$(mss_login_revision_file)")"
   fi
-  echo "[comfyui-deploy] MSS-Login pin mismatch at ${canon}." >&2
+  actual="$(git -C "$canon" -c safe.directory="$canon" rev-parse HEAD 2>/dev/null || true)"
+  actual="$(printf '%s' "$actual" | tr -d '[:space:]')"
   echo "[comfyui-deploy] Image REVISION: ${expected:-<empty>}" >&2
   if [[ -n "$actual" ]]; then
     echo "[comfyui-deploy] Checkout HEAD: ${actual}" >&2
   else
     echo "[comfyui-deploy] Checkout HEAD: (none; no git checkout)" >&2
   fi
-  if is_truthy "${MSS_LOGIN_ALLOW_UNPINNED:-false}"; then
-    echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED is enabled. Continuing with this checkout instead of image pin ${expected}. The host checkout was not modified." >&2
-    return 0
-  fi
-  echo "[comfyui-deploy] Refusing to start. The host checkout was not modified. Set MSS_LOGIN_ALLOW_UNPINNED=true to run it anyway, or rebuild with MSS_LOGIN_REF set to the checkout sha." >&2
+}
+
+refuse_mss_login() {
+  echo "[comfyui-deploy] Refusing to start. $*" >&2
+  echo "[comfyui-deploy] The host checkout was not modified." >&2
   exit 1
 }
 
@@ -165,6 +309,7 @@ prepare_mss_login() {
     exit 1
   fi
   mkdir -p "$nodes_root"
+  load_mss_login_fingerprints
   while IFS= read -r line; do
     [[ -n "$line" ]] && found+=("$line")
   done < <(discover_mss_login_dirs "$nodes_root")
@@ -180,81 +325,113 @@ prepare_mss_login() {
   if ((${#found[@]} == 1)); then
     MSS_LOGIN_RUNTIME_DIR="${found[0]}"
     export MSS_DIR="$MSS_LOGIN_RUNTIME_DIR"
-    if [[ "$(basename "$MSS_LOGIN_RUNTIME_DIR")" != "$base" ]]; then
-      echo "[comfyui-deploy] MSS-Login package is at ${MSS_LOGIN_RUNTIME_DIR}, not ${nodes_root}/${base}. Using the existing checkout and not seeding another copy."
-    else
-      echo "[comfyui-deploy] MSS-Login checkout at ${MSS_LOGIN_RUNTIME_DIR} is already present; leaving it unchanged."
+    if exact_mss_login_copy "$MSS_LOGIN_RUNTIME_DIR"; then
+      if [[ "$(basename "$MSS_LOGIN_RUNTIME_DIR")" != "$base" ]]; then
+        echo "[comfyui-deploy] MSS-Login package is at ${MSS_LOGIN_RUNTIME_DIR}, not ${nodes_root}/${base}. Using the existing checkout and not seeding another copy."
+      else
+        echo "[comfyui-deploy] MSS-Login checkout at ${MSS_LOGIN_RUNTIME_DIR} is already present; leaving it unchanged."
+      fi
+      log_mss_login_remote "$MSS_LOGIN_RUNTIME_DIR"
+      echo "[comfyui-deploy] MSS-Login at ${MSS_LOGIN_RUNTIME_DIR} matches image pin $(tr -d '[:space:]' <"$(mss_login_revision_file)")."
+      return 0
     fi
-    log_mss_login_remote "$MSS_LOGIN_RUNTIME_DIR"
-  else
-    dest="${nodes_root}/${base}"
-    seed_mss_login_into "$dest"
-    MSS_LOGIN_RUNTIME_DIR="$dest"
-    export MSS_DIR="$dest"
+    if mss_login_break_glass; then
+      log_pin_facts "$MSS_LOGIN_RUNTIME_DIR"
+      echo "[comfyui-deploy] WARNING: MSS_LOGIN_ALLOW_UNPINNED break-glass is enabled for ${MSS_LOGIN_RUNTIME_DIR}. The tree does not match the image pin. This is an emergency bypass, not a normal start. The host checkout was not modified." >&2
+      return 0
+    fi
+    log_pin_facts "$MSS_LOGIN_RUNTIME_DIR"
+    refuse_mss_login "MSS-Login content at ${MSS_LOGIN_RUNTIME_DIR} does not exactly match the image pin (tree, commit object, or git status)."
   fi
-  enforce_mss_login_pin "$MSS_LOGIN_RUNTIME_DIR"
+
+  dest="${nodes_root}/${base}"
+  seed_mss_login_into "$dest"
+  MSS_LOGIN_RUNTIME_DIR="$dest"
+  export MSS_DIR="$dest"
+  if ! exact_mss_login_copy "$MSS_LOGIN_RUNTIME_DIR"; then
+    refuse_mss_login "Seeded MSS-Login at ${dest} failed the image pin check."
+  fi
+  echo "[comfyui-deploy] MSS-Login at ${MSS_LOGIN_RUNTIME_DIR} matches image pin $(tr -d '[:space:]' <"$(mss_login_revision_file)")."
 }
 
-requirement_line_forbidden() {
+requirement_line_rejected() {
   local line="$1"
-  [[ "$line" =~ (^|[[:space:]])(-i|--index-url|--extra-index-url|--trusted-host|--find-links)([[:space:]=]|$) ]] && return 0
-  [[ "$line" =~ (^|[[:space:]])-f[[:space:]] ]] && return 0
-  [[ "$line" =~ (^|[[:space:]])(-r|--requirement)([[:space:]=]|$) ]] && return 0
+  local lower
+  lower="${line,,}"
+  [[ "$line" == -* ]] && return 0
+  [[ "$lower" == *index-url* || "$lower" == *trusted-host* || "$lower" == *find-links* || "$lower" == *no-index* ]] && return 0
+  [[ "$lower" == *"--constraint"* || "$lower" == *" constraint "* ]] && return 0
+  [[ "$line" =~ (^|[[:space:]])-[cirfe]([^[:alnum:]]|$) ]] && return 0
+  [[ "$lower" =~ (^|[[:space:]])--(constraint|requirement|editable)([[:space:]=]|$) ]] && return 0
+  [[ "$line" == *"://"* || "$line" == *git+* || "$line" == *"@"* || "$line" == *\\* ]] && return 0
+  [[ "$line" == /* || "$line" == ./* || "$line" == ../* || "$line" == "~"* ]] && return 0
+  [[ "$line" == *"/../"* || "$line" == *"../"* ]] && return 0
   return 1
 }
 
-requirement_line_is_url() {
+requirement_line_is_safe_spec() {
   local line="$1"
-  [[ "$line" == *git+* ]] && return 0
-  [[ "$line" =~ ^[[:space:]]*(https?|ssh|git):// ]] && return 0
-  [[ "$line" =~ @[[:space:]]*(https?|ssh|git):// ]] && return 0
-  [[ "$line" =~ @[[:space:]]*git\+ ]] && return 0
-  return 1
+  [[ "$line" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9_,.\-]+\])?([[:space:]]*(===|==|~=|!=|<=|>=|<|>)[[:space:]]*[A-Za-z0-9.*+!_-]+)*$ ]]
+}
+
+consider_requirement_line() {
+  local logical="$1" dest="$2" node_name="$3"
+  local trimmed
+  trimmed="${logical#"${logical%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  if [[ -z "$trimmed" || "${trimmed}" == \#* ]]; then
+    return 0
+  fi
+  if requirement_line_rejected "$trimmed" || ! requirement_line_is_safe_spec "$trimmed"; then
+    echo "[comfyui-deploy] ${node_name}: ignoring requirement line: ${trimmed}" >&2
+    return 0
+  fi
+  printf '%s\n' "$trimmed" >>"$dest"
 }
 
 filter_requirements_file() {
-  local src="$1" dest="$2" node_name="$3" allow_urls="$4"
-  local line trimmed
+  local src="$1" dest="$2" node_name="$3"
+  local line logical=""
   : >"$dest"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    trimmed="${line#"${line%%[![:space:]]*}"}"
-    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-    if [[ -z "$trimmed" || "${trimmed}" == \#* ]]; then
+  # Fourth argument is ignored. URL and option lines are never installed.
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    line="${line//$'\r'/}"
+    if [[ "$line" == *\\ ]]; then
+      logical+="${line%\\}"
       continue
     fi
-    if requirement_line_forbidden "$trimmed"; then
-      echo "[comfyui-deploy] ${node_name}: ignoring requirement option: ${trimmed}" >&2
-      continue
-    fi
-    if requirement_line_is_url "$trimmed" && ! is_truthy "$allow_urls"; then
-      echo "[comfyui-deploy] ${node_name}: ignoring URL or git requirement: ${trimmed}" >&2
-      continue
-    fi
-    printf '%s\n' "$trimmed" >>"$dest"
+    logical+="$line"
+    consider_requirement_line "$logical" "$dest" "$node_name"
+    logical=""
   done <"$src"
+  if [[ -n "$logical" ]]; then
+    consider_requirement_line "$logical" "$dest" "$node_name"
+  fi
 }
 
 install_one_node_requirements() {
-  local node="$1" req="$2" name="$3" allow_urls="$4" constraints="$5" con_hash="$6"
-  local req_hash stamp current filtered uv_log uv_status
+  local node="$1" req="$2" name="$3" constraints="$4" con_hash="$5" revision="$6" build_id="$7"
+  local req_hash stamp current filtered uv_log uv_status stamp_key
   local -a only_bin=()
   local spec pkg key
 
   req_hash="$(sha256sum "$req" | awk '{print $1}')"
-  stamp="${node}/.mss-dep-stamp"
+  stamp="$(mss_stamp_dir)/${name}"
+  stamp_key="${req_hash} ${con_hash} ${revision} ${build_id}"
+  mkdir -p "$(mss_stamp_dir)"
   if [[ -f "$stamp" ]]; then
-    current="$(tr -d '[:space:]' <"$stamp")"
-    if [[ "$current" == "${req_hash}${con_hash}" ]]; then
+    current="$(tr -d '\n' <"$stamp")"
+    if [[ "$current" == "$stamp_key" ]]; then
       echo "[comfyui-deploy] Custom node ${name} requirements unchanged; skipping install."
       return 0
     fi
   fi
 
   filtered="$(mktemp)"
-  filter_requirements_file "$req" "$filtered" "$name" "$allow_urls"
+  filter_requirements_file "$req" "$filtered" "$name" false
   if [[ ! -s "$filtered" ]]; then
     echo "[comfyui-deploy] Custom node ${name} has no installable requirements after filtering."
-    printf '%s %s\n' "$req_hash" "$con_hash" >"$stamp" || true
+    printf '%s\n' "$stamp_key" >"$stamp" || true
     rm -f "$filtered"
     return 0
   fi
@@ -283,14 +460,14 @@ install_one_node_requirements() {
     printf '%s\n' "$uv_log" | tail -n 40 >&2
     return 0
   fi
-  if ! printf '%s %s\n' "$req_hash" "$con_hash" >"$stamp"; then
+  if ! printf '%s\n' "$stamp_key" >"$stamp"; then
     echo "[comfyui-deploy] Custom node ${name} installed, but the cache stamp could not be written." >&2
   fi
   echo "[comfyui-deploy] Custom node ${name} requirements installed."
 }
 
 install_custom_node_deps() {
-  local nodes_root node req name allow constraints con_hash
+  local nodes_root node req name constraints con_hash revision build_id allowlist allow_name
   if ! is_truthy "${INSTALL_CUSTOM_NODE_DEPS:-true}"; then
     echo "[comfyui-deploy] INSTALL_CUSTOM_NODE_DEPS is off; skipping custom-node installs."
     return 0
@@ -299,23 +476,52 @@ install_custom_node_deps() {
     echo "[comfyui-deploy] Refusing custom-node installs as uid $(id -u); they run only as uid ${COMFY_UID}." >&2
     return 0
   fi
-  constraints="$MSS_TORCH_CONSTRAINTS"
+  constraints="$(mss_torch_constraints_file)"
   if [[ ! -f "$constraints" ]]; then
     echo "[comfyui-deploy] Torch constraints file missing at ${constraints}; skipping custom-node installs." >&2
     return 0
   fi
   con_hash="$(sha256sum "$constraints" | awk '{print $1}')"
+  revision="none"
+  if [[ -f "$(mss_login_revision_file)" ]]; then
+    revision="$(tr -d '[:space:]' <"$(mss_login_revision_file)")"
+  fi
+  build_id="none"
+  if [[ -f "$(mss_build_id_file)" ]]; then
+    build_id="$(tr -d '[:space:]' <"$(mss_build_id_file)")"
+  fi
+  allowlist="$(mss_node_allowlist_file)"
+  if [[ ! -f "$allowlist" ]]; then
+    echo "[comfyui-deploy] Custom-node allowlist missing at ${allowlist}; skipping installs." >&2
+    return 0
+  fi
+  declare -A allowed=()
+  local allow_name
+  while IFS= read -r allow_name || [[ -n "$allow_name" ]]; do
+    allow_name="${allow_name#"${allow_name%%[![:space:]]*}"}"
+    allow_name="${allow_name%"${allow_name##*[![:space:]]}"}"
+    [[ -z "$allow_name" || "$allow_name" == \#* ]] && continue
+    allowed["$allow_name"]=1
+  done <"$allowlist"
   nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
   shopt -s nullglob
   for req in "${nodes_root}"/*/requirements.txt; do
     node="$(dirname "$req")"
     name="$(basename "$node")"
     [[ "$name" == .* ]] && continue
-    allow="false"
-    if [[ -n "${MSS_LOGIN_RUNTIME_DIR:-}" && "$(realpath "$node")" == "$(realpath "$MSS_LOGIN_RUNTIME_DIR")" ]]; then
-      allow="true"
+    if [[ -L "$node" ]]; then
+      echo "[comfyui-deploy] Skipping custom node ${name}: path is a symlink." >&2
+      continue
     fi
-    install_one_node_requirements "$node" "$req" "$name" "$allow" "$constraints" "$con_hash" || true
+    if is_mss_login_tree "$node" || { [[ -n "${MSS_LOGIN_RUNTIME_DIR:-}" ]] && [[ "$(realpath "$node")" == "$(realpath "$MSS_LOGIN_RUNTIME_DIR")" ]]; }; then
+      echo "[comfyui-deploy] Skipping ${name}: MSS-Login dependencies are installed at image build."
+      continue
+    fi
+    if [[ -z "${allowed[$name]:-}" ]]; then
+      echo "[comfyui-deploy] Skipping custom node ${name}: not on the dependency allowlist."
+      continue
+    fi
+    install_one_node_requirements "$node" "$req" "$name" "$constraints" "$con_hash" "$revision" "$build_id" || true
   done
   shopt -u nullglob
 }
@@ -334,6 +540,7 @@ prepare_as_root() {
   ensure_owned /home/comfy/user-scripts
   ensure_owned /home/comfy/.cache/huggingface/hub
   ensure_owned /home/comfy/.cache/torch/hub
+  ensure_owned /home/comfy/.insightface
   ensure_owned /home/comfy/.bashrc file
 }
 
