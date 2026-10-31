@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Freeze the torch, torchvision, torchaudio, and NVIDIA CUDA/cuDNN wheels
 # already installed in the image venv. Runtime custom-node installs use this
 # file so a requirements.txt cannot replace those builds.

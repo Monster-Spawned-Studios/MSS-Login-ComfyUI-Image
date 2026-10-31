@@ -240,4 +240,4 @@ Set in the container and not read from the stack environment:
 
 ## Updates inside a running container
 
-`docker exec -u 1000 comfyui-server /usr/local/bin/update.sh` updates ComfyUI and PyTorch. It does not replace MSS-Login. Change that pin with the steps in [Updating MSS-Login](#updating-mss-login).
+`/app/ComfyUI` is root-owned, so `comfy update` cannot change ComfyUI core inside a running container. A core update is a new image build. `docker exec -u 1000 comfyui-server /usr/local/bin/update.sh` can still refresh PyTorch wheels in the venv. It does not replace MSS-Login. Change that pin with the steps in [Updating MSS-Login](#updating-mss-login).

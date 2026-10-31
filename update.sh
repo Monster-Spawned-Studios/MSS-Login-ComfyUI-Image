@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Manual in-container updater for ComfyUI core and PyTorch wheels.
 # Does not fetch, reset, or overwrite MSS-Login. That pin changes only when
 # a new image is built with a new MSS_LOGIN_REF. See README "Updating MSS-Login".

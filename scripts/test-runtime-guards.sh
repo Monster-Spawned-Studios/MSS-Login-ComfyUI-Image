@@ -720,6 +720,83 @@ PY
   echo "install no-op case passed"
 }
 
+# shellcheck disable=SC2030,SC2031
+image_path_and_port_case() {
+  local script log status
+  for script in \
+    entrypoint.sh \
+    update.sh \
+    scripts/write-torch-constraints.sh \
+    scripts/write-mss-login-manifest.sh \
+    scripts/mss-login-healthcheck
+  do
+    [[ "$(head -n 1 "${root}/${script}")" == "#!/bin/bash" ]] || fail "${script} shebang is not #!/bin/bash"
+    if grep -q '#!/usr/bin/env' "${root}/${script}"; then
+      fail "${script} uses an env shebang"
+    fi
+  done
+  if grep -E 'PATH=.*\.venv' "${root}/Dockerfile"; then
+    fail "image ENV PATH contains .venv"
+  fi
+  if grep -n 'tar -xzf' "${root}/Dockerfile" | grep -q -- '-C /tmp'; then
+    fail "a tarball is extracted onto /tmp"
+  fi
+  grep -q 'stat -c %a /tmp' "${root}/Dockerfile" || fail "image does not check that /tmp is 1777"
+  log="$(mktemp)"
+  set +e
+  (
+    export STACK_CLI_ARGS="--port=9008@evil.example"
+    export EXTRA_CLI_ARGS=""
+    build_cli_args
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "port injection was allowed"
+  grep -q '9008@evil.example' "$log" || fail "port injection was not named: $(cat "$log")"
+  set +e
+  (
+    export STACK_CLI_ARGS=""
+    export EXTRA_CLI_ARGS=""
+    export COMFYUI_PORT='65536'
+    build_cli_args
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "over-long COMFYUI_PORT was allowed"
+  STACK_CLI_ARGS="--po 9100" EXTRA_CLI_ARGS="" COMFYUI_PORT=9008 build_cli_args >/dev/null
+  assert_eq "$(mss_listen_port)" "9100" "--po abbreviation must be the listen port"
+  if [[ "$CLI_ARGS" == *"--port 9008"* || "$CLI_ARGS" == *"--port=9008"* ]]; then
+    fail "default port was appended beside --po: ${CLI_ARGS}"
+  fi
+  set +e
+  (
+    export CLI_ARGS="--front-end-root /tmp/evil"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "--front-end-root was allowed"
+  set +e
+  (
+    export CLI_ARGS="--front-end-r /tmp/evil"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "--front-end-r was allowed"
+  set +e
+  (
+    export CLI_ARGS="--comfy-api-base http://evil.example"
+    refuse_cli_node_path_flags
+  ) >"$log" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "--comfy-api-base was allowed"
+  unset STACK_CLI_ARGS EXTRA_CLI_ARGS COMFYUI_PORT CLI_ARGS
+  rm -f "$log"
+  echo "image path and port case passed"
+}
+
 filter_case
 cache_case
 shadow_case
@@ -733,4 +810,5 @@ security_regressions
 stack250_cli_case
 root_loader_env_case
 install_noop_case
+image_path_and_port_case
 echo "all runtime guard tests passed"

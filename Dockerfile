@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_TOOL_DIR=/opt/uv-tools \
     UV_CACHE_DIR=/tmp/uv-cache \
     VIRTUAL_ENV=/app/ComfyUI/.venv \
-    PATH="/app/ComfyUI/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     MSS_LOGIN_SEED=/opt/mss-login/ComfyUI-MSS-Login \
     MSS_LOGIN_DATA_DIR=/data/mss-login \
     PYTHONPYCACHEPREFIX=/tmp/comfy-pycache \
@@ -123,9 +123,12 @@ RUN mkdir -p \
     && curl -fsSL -o /tmp/dotenvx.tar.gz \
         "https://github.com/dotenvx/dotenvx/releases/download/${DOTENVX_VERSION}/dotenvx-${DOTENVX_VERSION#v}-linux-x86_64.tar.gz" \
     && echo "${DOTENVX_SHA256}  /tmp/dotenvx.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/dotenvx.tar.gz -C /tmp \
-    && mv /tmp/dotenvx /usr/local/bin/dotenvx \
-    && rm -f /tmp/dotenvx.tar.gz \
+    && dotenvx_tmp="$(mktemp -d)" \
+    && tar -xzf /tmp/dotenvx.tar.gz -C "${dotenvx_tmp}" \
+    && mv "${dotenvx_tmp}/dotenvx" /usr/local/bin/dotenvx \
+    && rm -rf "${dotenvx_tmp}" /tmp/dotenvx.tar.gz \
+    && chmod 1777 /tmp \
+    && test "$(stat -c %a /tmp)" = "1777" \
     && chown root:root /usr/local/bin/dotenvx \
     && chmod 755 /usr/local/bin/dotenvx \
     && (getent group comfy >/dev/null || groupadd --gid 1000 comfy) \

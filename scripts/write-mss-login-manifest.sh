@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Write the baked MSS-Login lists.
 # MANIFEST is sha256 of regular files. MANIFEST.entries is every non-directory
 # (files, symlinks, fifos). MANIFEST.dirs is every directory except the root.

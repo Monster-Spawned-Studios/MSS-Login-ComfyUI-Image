@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Container entrypoint.
 # Starts as root only long enough to chown root-owned volume data to uid 1000
 # and to seed the MSS-Login shadow. The host custom_nodes/MSS-Login checkout
@@ -51,13 +51,18 @@ comfy_python() {
 }
 
 reset_comfy_pycache() {
+  if [[ -n "${PYTHONPYCACHEPREFIX:-}" && "${PYTHONPYCACHEPREFIX}" != "/tmp/comfy-pycache" ]]; then
+    echo "[comfyui-deploy] Refusing PYTHONPYCACHEPREFIX=${PYTHONPYCACHEPREFIX}. Only /tmp/comfy-pycache is allowed." >&2
+    exit 1
+  fi
+  export PYTHONPYCACHEPREFIX=/tmp/comfy-pycache
   if [[ "$(/usr/bin/id -u)" -ne 0 ]]; then
     return 0
   fi
-  rm -rf "$PYTHONPYCACHEPREFIX"
-  mkdir -p "$PYTHONPYCACHEPREFIX"
-  chown "${COMFY_UID}:${COMFY_GID}" "$PYTHONPYCACHEPREFIX"
-  chmod 0700 "$PYTHONPYCACHEPREFIX"
+  rm -rf /tmp/comfy-pycache
+  mkdir -p /tmp/comfy-pycache
+  chown "${COMFY_UID}:${COMFY_GID}" /tmp/comfy-pycache
+  chmod 0700 /tmp/comfy-pycache
 }
 
 COMFY_UID=1000
@@ -992,7 +997,9 @@ cli_denied_flag_names() {
     --input-directory \
     --previews-directory \
     --user-directory \
-    --models-directory
+    --models-directory \
+    --front-end-root \
+    --comfy-api-base
 }
 
 cli_node_path_flag_denied() {
@@ -1086,14 +1093,26 @@ collapse_ws() {
   printf '%s' "${parts[*]}"
 }
 
+valid_tcp_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
+}
+
+# A token counts when it is the flag or a prefix of it, including --flag=value.
+# That matches the denied-flag check, so --po is seen as --port.
 cli_has_flag() {
-  local argline="$1" flag="$2" token
+  local argline="$1" flag="$2" token bare
   local -a arr=()
   set -f
   read -r -a arr <<< "$argline"
   set +f
   for token in "${arr[@]}"; do
-    [[ "$token" == "$flag" || "$token" == "${flag}="* ]] && return 0
+    bare="${token%%=*}"
+    [[ "$bare" == --* ]] || continue
+    if [[ "$flag" == "$bare" || "$flag" == "$bare"* ]]; then
+      return 0
+    fi
   done
   return 1
 }
@@ -1101,21 +1120,34 @@ cli_has_flag() {
 # Last --port wins, matching argparse. Image defaults are omitted when the
 # user string already contains --listen or --port.
 mss_listen_port() {
-  local argline="${1:-${CLI_ARGS:-}}" token prev="" value=""
+  local argline="${1:-${CLI_ARGS:-}}" token bare prev="" value=""
   local -a arr=()
   set -f
   read -r -a arr <<< "$argline"
   set +f
   for token in "${arr[@]}"; do
-    if [[ "$prev" == "--port" && "$token" != --* ]]; then
+    if [[ -n "$prev" ]]; then
       value="$token"
-    elif [[ "$token" == --port=* ]]; then
-      value="${token#--port=}"
+      prev=""
+      continue
     fi
-    prev="$token"
+    bare="${token%%=*}"
+    if [[ "$bare" == --* && ( "--port" == "$bare" || "--port" == "$bare"* ) ]]; then
+      if [[ "$token" == *=* ]]; then
+        value="${token#*=}"
+      else
+        prev=1
+      fi
+    fi
   done
+  if [[ -n "$prev" ]]; then
+    refuse_mss_login "Refusing --port without a value."
+  fi
   if [[ -z "$value" ]]; then
     value="${COMFYUI_PORT:-9008}"
+  fi
+  if ! valid_tcp_port "$value"; then
+    refuse_mss_login "Refusing port '${value}'. A port must be an integer from 1 to 65535."
   fi
   printf '%s\n' "$value"
 }
@@ -1143,6 +1175,9 @@ build_cli_args() {
   fi
   listen="${COMFYUI_HOST:-0.0.0.0}"
   port="${COMFYUI_PORT:-9008}"
+  if ! valid_tcp_port "$port"; then
+    refuse_mss_login "Refusing COMFYUI_PORT '${port}'. A port must be an integer from 1 to 65535."
+  fi
   cors="${CORS:-*}"
   vram="${VRAM_RESERVE_GB:-1.5}"
   local -a defaults=()
@@ -1170,6 +1205,7 @@ build_cli_args() {
   fi
   export CLI_ARGS
   normalize_frontend_flag
+  mss_listen_port >/dev/null
 }
 
 refuse_cli_node_path_flags() {
