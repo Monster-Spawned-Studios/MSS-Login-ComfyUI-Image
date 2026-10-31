@@ -1,138 +1,146 @@
-# ComfyUI MSS-Login Docker Deployment
+# ComfyUI MSS-Login image
 
-This directory contains the production Docker deployment stack for **ComfyUI** running with the **MSS-Login** extension, RBAC, WebAuthn MFA, and model isolation.
+Production image and Portainer stack for ComfyUI plus the [ComfyUI-MSS-Login](https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login) custom node.
 
-It is designed to compile, deploy, and run cleanly out of the box across **macOS (Apple Silicon & Intel)**, **Linux (NVIDIA, AMD ROCm, Intel Arc, and CPU)**, and **Windows 11 Pro (WSL2)**.
+The stack pulls `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia`. It does not build during deploy. The `:nvidia` tag is published only by a manual GitHub Actions run.
 
-## Architecture & Sub-Image Targets
+## Publish
 
-The multi-stage `deploy/Dockerfile` provides specialized sub-image targets while retaining dynamic runtime hardware detection:
+Workflow: `.github/workflows/publish-ghcr.yml`.
 
-| Sub-Image Target | Docker Target | Pre-built Image Tag | Best For |
-|---|---|---|---|
-| **Universal (Auto)** | `auto` (default) | `monster-spawned-studios/comfyui-mss-login:latest` | Universal auto-detection on boot across any host |
-| **NVIDIA CUDA** | `nvidia` | `monster-spawned-studios/comfyui-mss-login:nvidia` | Linux & Windows 11 WSL2 with NVIDIA GPUs (CUDA cu128/cu130) |
-| **AMD ROCm** | `rocm` | `monster-spawned-studios/comfyui-mss-login:rocm` | Linux with AMD Radeon / Instinct GPUs (ROCm 6.2.4) |
-| **CPU Mode** | `cpu` | `monster-spawned-studios/comfyui-mss-login:cpu` | macOS (Docker Desktop), CPU-only servers, CI/CD |
+- Trigger: `workflow_dispatch` only. No push, tag, or schedule.
+- Auth: the workflow `GITHUB_TOKEN` with `packages: write`. No other secrets.
+- Target: Dockerfile stage `nvidia` (default CUDA channel `cu130`).
+- Every run pushes `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<commit>`.
+- `push_nvidia_tag` also pushes `:nvidia`. Its default is **off**. Portainer re-pulls `:nvidia`, so leave this off until the image is ready to deploy.
+- `:latest` is refused.
+- ComfyUI-MSS-Login is fetched over HTTPS at build time. Default ref is `6f33be97315fa33997d98afc09f439b7a8fc4763` (`6f33be9`). The repo URL cannot contain credentials.
 
-## Immich-Style Hardware Acceleration Companion Scripts
+Build args:
 
-Following the companion configuration architecture popularized by Immich (see [Immich v3.3.5](https://github.com/immich-app/immich/releases/tag/v3.3.5) with `hwaccel.ml.yml`), hardware-specific configurations are split into companion sub-compose scripts so the main stack remains clean and portable:
+| Arg | Default |
+|---|---|
+| `MSS_LOGIN_REPO` | `https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git` |
+| `MSS_LOGIN_REF` | `6f33be97315fa33997d98afc09f439b7a8fc4763` |
+| `CUDA_VERSION` | `cu130` on the nvidia stage (`cu128` is the other accepted value) |
 
-- **`hwaccel.ml.yml`**: Unified companion configuration with `cuda`, `rocm`, and `cpu` services.
-- **`hwaccel.nvidia.yml`**: Dedicated overlay for NVIDIA CUDA GPU devices and drivers.
-- **`hwaccel.rocm.yml`**: Dedicated overlay for AMD ROCm (`/dev/kfd` and `/dev/dri`).
-- **`hwaccel.cpu.yml`**: Dedicated overlay for lightweight CPU execution.
-
-### Usage with `extends` (Portainer Web UI or Docker Compose)
-
-In `portainer-stack.yml` or `docker-compose.yml`, uncomment the companion `extends` block:
-
-```yaml
-services:
-  comfyui-server:
-    extends:
-      file: hwaccel.ml.yml
-      service: cuda    # Options: [cuda, rocm, cpu]
-```
-
-### Usage with Docker Compose Multi-File Overlays (CLI)
+`cpu`, `rocm`, and `auto` remain Dockerfile targets. Build them locally with `docker build --target cpu` (or `rocm` / `auto`). The workflow does not publish those tags.
 
 ```bash
-# NVIDIA CUDA (Linux / Windows 11 WSL2)
-docker compose -f portainer-stack.yml -f hwaccel.nvidia.yml up -d
-
-# AMD ROCm (Linux)
-docker compose -f portainer-stack.yml -f hwaccel.rocm.yml up -d
-
-# CPU Mode (macOS / CPU-only)
-docker compose -f portainer-stack.yml -f hwaccel.cpu.yml up -d
+docker build --target nvidia \
+  --build-arg MSS_LOGIN_REF=6f33be97315fa33997d98afc09f439b7a8fc4763 \
+  -t ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia .
 ```
 
-## Portainer Deployment & GitOps Automation
+## What the image contains
 
-You can deploy this stack in **Portainer CE/EE** via direct Web UI editor paste, manual Git repository polling, or fully automated GitOps deployment (polling and webhooks).
+- ComfyUI under `/app/ComfyUI`, Python 3.13 via uv, user `comfy` (uid/gid 1000).
+- ComfyUI-MSS-Login at `/opt/mss-login/ComfyUI-MSS-Login` (the image seed).
+- `curl`, used by the healthcheck.
+- NVIDIA stage: PyTorch CUDA wheels and `LD_LIBRARY_PATH` pointed at the venv cuDNN/CUDA libraries (`/app/ComfyUI/.venv/lib/python3.13/site-packages/...`). This replaces `user-scripts/00-setup-uv-venv.sh`, which targeted `/root/ComfyUI/.venv`. The script is still mounted and is not executed.
+- `entrypoint.sh` copies the seed into `custom_nodes/ComfyUI-MSS-Login` only when that directory is missing or empty. An existing checkout is not modified.
+- The container starts as root (`user: "0:0"`) so the entrypoint can `chown` root-owned volume data to uid 1000, then drops privileges with `setpriv`. A directory whose top-level owner is already 1000 is not walked again.
 
-### Option A: Web UI Stack Editor (Direct Paste)
+## Portainer
 
-1. Navigate to **Stacks** in Portainer and click **Add stack**.
-2. Select the **Web editor** build method.
-3. Name your stack (e.g., `comfyui-mss-server`).
-4. Paste the contents of `portainer-stack.yml` into the editor.
-5. In the **Environment variables** section below the editor:
-   - Click **Load variables from .env file** and upload your `.env` (derived from `.env.example`), OR click **Add environment variable** to manually set `HOST_BASE_URL` and `SECRET_KEY`.
-6. To enable hardware acceleration, uncomment the `extends` block in the YAML:
-   ```yaml
-   extends:
-     file: hwaccel.ml.yml
-     service: cuda    # or rocm, cpu
-   ```
-7. Click **Deploy the stack**.
+Compose path: `portainer-stack.yml`. Do not attach the `hwaccel.*.yml` files. GPU passthrough for both devices is already in the stack (`CUDA_VISIBLE_DEVICES` default `0,1`, NVIDIA device reservation `count: all`).
 
----
+Runtime defaults: memory limit `20g`, memswap `24g`, CPU limit `8`, CPU reservation `4`, `--cache-lru 1`, `--disable-smart-memory`, `--reserve-vram` from `VRAM_RESERVE_GB` (default `1.5`).
 
-### Option B: Portainer EE GitOps Deployment (Git Repository Pull / Push Webhooks)
+Ports: `100.65.194.86:9008` and `127.0.0.1:9008`.
 
-Portainer Enterprise Edition (EE) and Business Edition provide native **GitOps** capabilities to keep your running stack continuously synchronized with your Git repository.
+Watchtower labels default to `false`. That does not turn off Portainer's own re-pull of `:nvidia`.
 
-#### 1. Configure the Git Repository Stack in Portainer
+Container name is `comfyui-server`. Stack 250 used `comfyui-cuda-laptop`. ServerOps must point the Cloudflare tunnel at the new name. The compose service DNS name is still `comfyui-server`, so `http://comfyui-server:9008` is the in-network target. The tunnel container name stays `comfyui-prod-tunnel`.
 
-1. Navigate to **Stacks** -> **Add stack**.
-2. Select the **Repository** build method.
-3. Configure repository settings:
-   - **Repository URL**: `https://git.monsterspawned.studio/Monster-Spawned-Studios/comfyui-mss-login-docker.git` (or your repository/fork URL).
-   - **Repository reference**: `refs/heads/main` (or your target branch/tag).
-   - **Authentication**: Enable and supply your Git credentials / Personal Access Token (PAT) if the repository is private.
-   - **Compose path**: `portainer-stack.yml`
-   - **Additional paths (Multi-File Compose)**: If you prefer using companion overlays instead of editing YAML `extends`, click **Add file** under *Additional paths* and enter the matching overlay (e.g. `hwaccel.nvidia.yml`, `hwaccel.rocm.yml`, or `hwaccel.cpu.yml`). Portainer merges these files in order just like `docker compose -f ... -f ...`.
-4. Supply your environment variables:
-   - In the **Environment variables** section, define your configuration variables or click **Load variables from .env file** to upload your configured `.env` (derived from `.env.example`).
-   - Portainer injects these variables during Compose substitution and generates a container-accessible `stack.env`.
+`extra_model_paths.yaml` and `.bashrc` must already be files on the host. Docker creates a directory if a file bind is missing. `extra_model_paths.yaml` is mounted read-only, so the entrypoint cannot change its owner. If it is mode `600` and owned by root, make it readable by uid 1000 on the host (`chmod a+r`).
 
-#### 2. Automatic Pull Mechanism (Polling)
-- In the stack configuration under **Automatic updates**:
-  - Toggle **Automatic updates** to **ON**.
-  - Select **Mechanism**: **Polling**.
-  - Set the **Fetch interval** (e.g., `5m` or `1h`).
-  - Portainer will periodically query the Git remote, compare the latest remote commit SHA against the currently deployed SHA, pull new code, and redeploy the stack seamlessly.
+`input` and `user` are new host binds. Stack 250 kept those inside the `comfyui-laptop-data` volume (`/root/ComfyUI/input` and `/root/ComfyUI/user`). Copy them to `/mnt/tmd-secure/Data/Docker/ComfyUI/input` and `.../user` if they should follow this stack. Models, nodes, output, and mss-data stay on the same host directories as stack 250.
 
-#### 3. Automatic Push Mechanism (GitOps Webhook)
-For instantaneous zero-delay deployments when code or configurations are pushed to Git:
-- Under **Automatic updates**:
-  - Select **Mechanism**: **Webhook**.
-  - Portainer will generate a dedicated **Webhook URL** (e.g., `https://portainer.example.com/api/stacks/webhooks/...`).
-  - Copy this Webhook URL.
-- In your Git platform (Gitea, GitHub, or GitLab):
-  - Go to **Repository Settings** -> **Webhooks** -> **Add Webhook**.
-  - Paste the Portainer Webhook URL into the **Target URL / Payload URL**.
-  - Set Content Type to `application/json`.
-  - Trigger on **Push Events**.
-  - Save the webhook.
-- Whenever a commit is pushed to the target branch, your Git server sends a POST request to Portainer, triggering an immediate SHA comparison, repository pull, and stack redeployment.
+Before redeploy, clear any Portainer values that are still the old named-volume placeholders (`comfyui_models`, `comfyui_custom_nodes`, and the rest). A non-blank value replaces the `/mnt/tmd-secure/Data/Docker/ComfyUI/...` default. Also clear `COMFYUI_HOST` if it is `127.0.0.1`; the process must listen on `0.0.0.0` for the published ports, including the host watchdog on `127.0.0.1:9008`. `MODELS_DIR` and `NODES_DIR` in the stack environment are ignored. This image always uses `/app/ComfyUI/models` and `/app/ComfyUI/custom_nodes`.
 
-#### 4. Force Redeployment & Re-pulling Images
-- **Re-pull image**: Enable this toggle in Portainer so that during every GitOps redeployment, newer container images (such as floating tags like `:latest` or `:nvidia`) are automatically pulled from the registry even if the compose text itself did not change.
-- **Force redeployment**: When enabled, Portainer redeploys the stack on every trigger, ensuring local environment state does not drift from Git source-of-truth.
-- If Watchtower is also deployed, image auto-updates will honor the container label:
-  `com.centurylinklabs.watchtower.enable=true`.
-
-## Security & Vulnerability Scanning (Trivy)
-
-The Dockerfile and container configurations are hardened and scanned with **Trivy**:
-- Non-root user `comfy` (UID 1000) execution.
-- Security options: `no-new-privileges:true`.
-- Built-in container healthcheck instruction.
-- Zero high/critical misconfigurations.
-
-To scan locally:
-```bash
-docker run --rm -v $(pwd):/src aquasec/trivy:latest config /src/deploy/Dockerfile
-```
-
-## Maintenance & Updates
-
-To update ComfyUI core and MSS-Login inside a running container:
+Check the rendered stack with a blank env file:
 
 ```bash
-docker exec -it comfyui-server /app/update.sh
+docker compose --env-file .env.example -f portainer-stack.yml config
 ```
+
+## Variables the compose file reads
+
+Blank means the default. `.env.example` lists the same names with blank values. Paste real values into Portainer, not into git.
+
+| Stack variable | Default when blank | Container variable |
+|---|---|---|
+| `COMFYUI_IMAGE` | `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia` | image reference, not an env var |
+| `COMFYUI_BIND_TAILSCALE` | `100.65.194.86` | published address |
+| `COMFYUI_HOST` | `0.0.0.0` | inside `CLI_ARGS` (`--listen`) |
+| `COMFYUI_PORT` | `9008` | inside `CLI_ARGS` and the healthcheck |
+| `SHM_SIZE` | `4g` | shm size |
+| `MEM_LIMIT` | `20g` | mem limit and deploy memory limit |
+| `MEMSWAP_LIMIT` | `24g` | memswap limit |
+| `CPUS_LIMIT` | `8` | CPU limit |
+| `CPUS` | `4` | CPU reservation |
+| `MEMORY` | `8G` | memory reservation |
+| `AUTO_UPDATE` | `false` | Watchtower label on both services |
+| `CUDA_VISIBLE_DEVICES` | `0,1` | `CUDA_VISIBLE_DEVICES` |
+| `NVIDIA_VISIBLE_DEVICES` | `all` | `NVIDIA_VISIBLE_DEVICES` |
+| `NVIDIA_DRIVER_CAPABILITIES` | `compute,utility` | `NVIDIA_DRIVER_CAPABILITIES` |
+| `DEVICE_TYPE` | `cuda` | `DEVICE_TYPE` |
+| `USE_CPU` | `0` | `USE_CPU` |
+| `FORCE_REINSTALL_TORCH` | `0` | `FORCE_REINSTALL_TORCH` |
+| `CORS` | `*` | inside `CLI_ARGS` |
+| `VRAM_RESERVE_GB` | `1.5` | inside `CLI_ARGS` (`--reserve-vram`) |
+| `FRONTEND_VERSION` | `latest` | inside `CLI_ARGS` (`--front-end-version`) |
+| `EXTRA_CLI_ARGS` | empty | appended to `CLI_ARGS` |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | `PYTORCH_CUDA_ALLOC_CONF` |
+| `TZ` | `America/Boise` | `TZ` and `TIME_ZONE` |
+| `CIVITAI_TOKEN` | empty | `CIVITAI_TOKEN` |
+| `LOGIN_DEBUG_MODE` | `false` | `DEBUG_MODE` |
+| `SECRET_KEY` | empty | `SECRET_KEY` |
+| `NTFY_AUTH_TOKEN` | empty | `NTFY_API_KEY` |
+| `HOST_BASE_URL` | `http://127.0.0.1:9008` | `HOST_BASE_URL` |
+| `PREFER_OPENAI_AGENTS` | `1` | `COMFYUI_COPILOT_PREFER_OPENAI_AGENTS` |
+| `MSS_DATA_DIR` | `/data/mss-login` | `MSS_LOGIN_DATA_DIR` and the mss-data mount target |
+| `POST_HOST` | empty | `POSTGRES_HOST` |
+| `POST_PORT` | empty | `POSTGRES_PORT` |
+| `POST_DB` | empty | `POSTGRES_DATABASE` |
+| `POST_USER` | empty | `POSTGRES_USER` |
+| `POST_PASS` | empty | `POSTGRES_PASSWORD` |
+| `CPE_EMBEDDED_CONVERT` | `true` | `CPE_EMBEDDED_CONVERT` |
+| `EXPERIMENTAL_LOGIN_BACKGROUND` | `true` | `EXPERIMENTAL_LOGIN_BACKGROUND` |
+| `WEBAUTHN_RP_ID` | empty | `WEBAUTHN_RP_ID` |
+| `WEBAUTHN_RP_NAME` | `ComfyUI MSS-Login` | `WEBAUTHN_RP_NAME` |
+| `WEBAUTHN_ORIGINS` | empty | `WEBAUTHN_ORIGINS` |
+| `PYTHONUNBUFFERED` | `1` | `PYTHONUNBUFFERED` |
+| `COMFYUI_USER_SCRIPTS_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/user-scripts` | host path mounted at `/home/comfy/user-scripts` |
+| `COMFYUI_MODELS_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/models` | host path mounted at `/app/ComfyUI/models` |
+| `COMFYUI_CUSTOM_NODES_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/nodes` | host path. The container value of this name is always `/app/ComfyUI/custom_nodes` |
+| `COMFYUI_OUTPUT_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/output` | host path mounted at `/app/ComfyUI/output` |
+| `COMFYUI_INPUT_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/input` | host path mounted at `/app/ComfyUI/input` |
+| `COMFYUI_USER_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/user` | host path mounted at `/app/ComfyUI/user` |
+| `COMFYUI_MSS_DATA_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/mss-data` | host path. Mounted at `MSS_DATA_DIR` |
+| `COMFYUI_EXTRA_MODEL_PATHS` | `/mnt/tmd-secure/Data/Docker/ComfyUI/extra_model_paths.yaml` | host file mounted read-only at `/app/ComfyUI/extra_model_paths.yaml` |
+| `COMFYUI_BASHRC` | `/mnt/tmd-secure/Data/Docker/ComfyUI/.bashrc` | host file mounted at `/home/comfy/.bashrc` |
+| `COMFYUI_HF_CACHE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/hf-cache` | host path mounted at `/home/comfy/.cache/huggingface/hub` |
+| `COMFYUI_TORCH_CACHE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/torch-cache` | host path mounted at `/home/comfy/.cache/torch/hub` |
+| `COMFY_TUNNEL_TOKEN` | empty | `TUNNEL_TOKEN` on `comfyui-prod-tunnel` |
+
+Set in the container and not read from the stack environment:
+
+| Container variable | Value |
+|---|---|
+| `HOME` | `/home/comfy` |
+| `MODELS_DIR` | `/app/ComfyUI/models` |
+| `NODES_DIR` | `/app/ComfyUI/custom_nodes` |
+| `COMFYUI_CUSTOM_NODES_DIR` | `/app/ComfyUI/custom_nodes` |
+| `CLI_ARGS` | assembled from the listen, port, CORS, cross-attention, reserve-vram, frontend, `--disable-smart-memory`, and `--cache-lru 1` flags |
+| `LD_LIBRARY_PATH` | venv `torch/lib` and `nvidia/{cu13,cudnn,cusparselt,nccl,nvshmem}/lib` |
+| `HF_HOME` | `/home/comfy/.cache/huggingface` |
+| `HUGGINGFACE_HUB_CACHE` | `/home/comfy/.cache/huggingface/hub` |
+| `TORCH_HOME` | `/home/comfy/.cache/torch` |
+
+`NTFY_AUTH_TOKEN` and `POST_HOST` / `POST_PORT` / `POST_DB` / `POST_USER` / `POST_PASS` keep the stack 250 names. The container still sees `NTFY_API_KEY` and `POSTGRES_*`.
+
+## Updates inside a running container
+
+`docker exec -u 1000 comfyui-server /app/update.sh` updates ComfyUI and PyTorch. It does not replace the MSS-Login checkout. Change that pin by publishing a new image.

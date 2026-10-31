@@ -1,41 +1,64 @@
 #!/usr/bin/env bash
+# Manual in-container updater for ComfyUI core and PyTorch wheels.
+# Does not fetch, reset, or overwrite ComfyUI-MSS-Login. Replace that pin by
+# building a new image. If docker exec starts this script as root, it drops
+# to uid 1000 before writing into the venv.
 set -euo pipefail
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  export HOME="${HOME:-/home/comfy}"
+  export USER=comfy
+  export LOGNAME=comfy
+  exec setpriv --reuid=1000 --regid=1000 --init-groups --inh-caps=-all -- "$0" "$@"
+fi
 
 ARCH="$(uname -m)"
 OS="$(uname -s)"
 VENV_DIR="${VIRTUAL_ENV:-/app/ComfyUI/.venv}"
 STAMP_FILE="${VENV_DIR}/.mss_torch_backend"
-MSS_DIR="/app/ComfyUI/custom_nodes/ComfyUI-MSS-Login"
+export MSS_DIR="${NODES_DIR:-/app/ComfyUI/custom_nodes}/ComfyUI-MSS-Login"
 
-echo "[comfyui-deploy] Checking for ComfyUI updates via comfy-cli..."
+echo "[comfyui-deploy] MSS-Login at ${MSS_DIR} is left as-is."
+echo "[comfyui-deploy] Checking for ComfyUI updates via comfy-cli (${OS} / ${ARCH})..."
 comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI update comfy
 
-echo "[comfyui-deploy] Detecting GPU backend and updating dependencies for $OS ($ARCH)..."
-read -r TARGET_BACKEND TARGET_INDEX TARGET_REQ < <(
-    python - <<'PY'
+detect_line="$(
+  python - <<'PY'
+import os
 import sys
-sys.path.insert(0, "/app/ComfyUI/custom_nodes/ComfyUI-MSS-Login")
-from utils.install_deps import detect_torch_install_plan
-plan = detect_torch_install_plan()
-print(f"{plan.get('backend') or 'cpu'} {plan.get('extra_index_url') or 'pypi'} {plan.get('requirements_file') or 'requirements.txt'}")
-PY
-)
 
-echo "[comfyui-deploy] Updating PyTorch & MSS-Login dependencies for backend '${TARGET_BACKEND}'..."
-UV_ARGS=(pip install -U --python "$(command -v python)" "torch>=2.13.0" torchvision torchaudio)
+sys.path.insert(0, os.environ["MSS_DIR"])
+from utils.install_deps import detect_torch_install_plan
+
+plan = detect_torch_install_plan()
+print(
+    f"{plan.get('backend') or 'cpu'} {plan.get('extra_index_url') or 'pypi'} {plan.get('requirements_file') or 'requirements.txt'}"
+)
+PY
+)"
+read -r TARGET_BACKEND TARGET_INDEX TARGET_REQ <<<"${detect_line}"
+
+echo "[comfyui-deploy] Updating PyTorch and MSS-Login dependencies for backend '${TARGET_BACKEND}'..."
+uv_args=(
+  pip install -U
+  --python "$(command -v python)"
+  "torch>=2.13.0"
+  torchvision
+  torchaudio
+)
 if [[ "$TARGET_INDEX" != "pypi" && -n "$TARGET_INDEX" ]]; then
-    UV_ARGS+=(--index-url "$TARGET_INDEX" --extra-index-url "https://pypi.org/simple")
+  uv_args+=(--index-url "$TARGET_INDEX" --extra-index-url "https://pypi.org/simple")
 fi
-uv "${UV_ARGS[@]}"
+uv "${uv_args[@]}"
 
 if [[ -f "${MSS_DIR}/${TARGET_REQ}" ]]; then
-    REQ_ARGS=(pip install -U --python "$(command -v python)" -r "${MSS_DIR}/${TARGET_REQ}")
-    if [[ "$TARGET_INDEX" != "pypi" && -n "$TARGET_INDEX" ]]; then
-        REQ_ARGS+=(--extra-index-url "$TARGET_INDEX")
-    fi
-    uv "${REQ_ARGS[@]}"
+  req_args=(pip install -U --python "$(command -v python)" -r "${MSS_DIR}/${TARGET_REQ}")
+  if [[ "$TARGET_INDEX" != "pypi" && -n "$TARGET_INDEX" ]]; then
+    req_args+=(--extra-index-url "$TARGET_INDEX")
+  fi
+  uv "${req_args[@]}"
 fi
 
 mkdir -p "$(dirname "$STAMP_FILE")"
-echo "$TARGET_BACKEND" > "$STAMP_FILE"
-echo "[comfyui-deploy] Update completed successfully (backend: ${TARGET_BACKEND})."
+printf '%s\n' "$TARGET_BACKEND" >"$STAMP_FILE"
+echo "[comfyui-deploy] Update completed (backend: ${TARGET_BACKEND})."

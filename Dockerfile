@@ -1,92 +1,112 @@
-# Multi-stage hardware-optimized Dockerfile for ComfyUI with MSS-Login
-# Base: Ubuntu 24.04 LTS (Noble Numbat)
+# ComfyUI runtime. ComfyUI-MSS-Login is not in this repository; the image
+# fetches it over HTTPS at build time. The default pin is commit 6f33be9
+# (6f33be97315fa33997d98afc09f439b7a8fc4763).
+# https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login
 #
-# Dedicated Sub-Image Targets:
-#   - cpu:    Pre-baked with PyTorch CPU wheels (macOS, CPU-only servers, CI/CD)
-#   - nvidia: Pre-baked with PyTorch NVIDIA CUDA wheels (cu128 / cu130)
-#   - rocm:   Pre-baked with PyTorch AMD ROCm wheels (rocm6.2.4)
-#   - auto:   Universal hardware auto-detecting image (default)
+# Targets: cpu, nvidia, rocm, auto. The GitHub workflow publishes nvidia only.
 
-ARG BASE_IMAGE=ubuntu:24.04
-FROM ${BASE_IMAGE} AS base
+FROM ubuntu:24.04 AS base
 
-ARG ACCELERATOR=auto
-ARG CUDA_VERSION=auto
+ARG MSS_LOGIN_REPO=https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
+ARG MSS_LOGIN_REF=6f33be97315fa33997d98afc09f439b7a8fc4763
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_INSTALL_DIR=/usr/local/bin \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
-    PATH="/app/ComfyUI/.venv/bin:/root/.local/bin:/usr/local/bin:$PATH"
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_TOOL_DIR=/opt/uv-tools \
+    UV_CACHE_DIR=/tmp/uv-cache \
+    VIRTUAL_ENV=/app/ComfyUI/.venv \
+    PATH="/app/ComfyUI/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    MSS_LOGIN_SEED=/opt/mss-login/ComfyUI-MSS-Login \
+    MSS_LOGIN_DATA_DIR=/data/mss-login \
+    DEVICE_TYPE=auto
 
-# Install system dependencies (libsqlcipher-dev, graphics, media libraries)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    git \
-    build-essential \
-    libsqlcipher-dev \
-    ffmpeg \
-    libgl1 \
-    libglib2.0-0 \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv for fast Python packaging & tool management
+# curl is the container healthcheck client. git fetches the pinned custom node.
+# libsqlcipher-dev builds sqlcipher3 from the pinned requirements.
+# uv installer: https://docs.astral.sh/uv/getting-started/installation/
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
-
-# Install hermetic Python 3.13 and official Comfy-CLI
-RUN uv python install 3.13 \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libsqlcipher-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv python install 3.13 \
     && uv tool install comfy-cli
 
 WORKDIR /app
 
-# Install ComfyUI core
-RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps
+RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps \
+    && rm -rf /tmp/uv-cache
 
-ENV VIRTUAL_ENV=/app/ComfyUI/.venv \
-    PATH="/app/ComfyUI/.venv/bin:$PATH"
+WORKDIR /opt/mss-login
+RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
+      echo "MSS_LOGIN_REPO must be an https:// URL" >&2; \
+      exit 1; \
+    fi \
+    && if [[ "${MSS_LOGIN_REPO}" == *"@"* ]]; then \
+      echo "MSS_LOGIN_REPO must not embed credentials" >&2; \
+      exit 1; \
+    fi \
+    && if [[ ! "${MSS_LOGIN_REF}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then \
+      echo "MSS_LOGIN_REF must be a 7-40 character commit SHA" >&2; \
+      exit 1; \
+    fi \
+    && git init --quiet ComfyUI-MSS-Login \
+    && git -C ComfyUI-MSS-Login remote add origin "${MSS_LOGIN_REPO}" \
+    && GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch --depth 1 origin "${MSS_LOGIN_REF}" \
+    && git -C ComfyUI-MSS-Login checkout --detach FETCH_HEAD \
+    && got="$(git -C ComfyUI-MSS-Login rev-parse HEAD)" \
+    && if [[ "${got}" != "${MSS_LOGIN_REF}"* ]]; then \
+      echo "checked out ${got}, wanted ${MSS_LOGIN_REF}" >&2; \
+      exit 1; \
+    fi \
+    && printf '%s\n' "${got}" > /opt/mss-login/REVISION \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python -r /opt/mss-login/ComfyUI-MSS-Login/requirements.txt \
+    && rm -rf /tmp/uv-cache
 
-# Copy MSS-Login extension into custom_nodes
-COPY . /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
+COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
+COPY --chmod=755 update.sh /app/update.sh
 
-WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
+RUN mkdir -p \
+        /data/mss-login \
+        /app/ComfyUI/custom_nodes \
+        /app/ComfyUI/input \
+        /app/ComfyUI/models \
+        /app/ComfyUI/output \
+        /app/ComfyUI/user \
+    && (getent group comfy >/dev/null || groupadd --gid 1000 comfy) \
+    && (id -u comfy >/dev/null 2>&1 || useradd --uid 1000 --gid 1000 --create-home --home-dir /home/comfy --shell /bin/bash comfy) \
+    && (getent group render >/dev/null || groupadd --system render) \
+    && usermod -aG video,render comfy \
+    && mkdir -p \
+        /home/comfy/.cache/huggingface/hub \
+        /home/comfy/.cache/torch/hub \
+        /home/comfy/user-scripts \
+    && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/mss-login /opt/uv-python /opt/uv-tools
 
-# Install non-backend-specific extension dependencies
-RUN uv pip install -r requirements.txt \
-    && (playwright install --with-deps chromium || true)
-
-# Provide entrypoint (runtime GPU auto-detection & PyTorch installer) and update script inside container
-COPY deploy/entrypoint.sh /app/entrypoint.sh
-COPY deploy/update.sh /app/update.sh
-RUN chmod +x /app/entrypoint.sh /app/update.sh
-
-# Create dedicated non-root user 'comfy' and data directory with proper ownership
-RUN mkdir -p /data/mss-login \
-    && (groupadd -r -g 1000 comfy || true) \
-    && (useradd -m -u 1000 -g 1000 -s /bin/bash comfy || true) \
-    && (groupadd -r render 2>/dev/null || true) \
-    && (usermod -aG video,render comfy 2>/dev/null || usermod -aG video comfy 2>/dev/null || true) \
-    && (chown -R 1000:1000 /app /data/mss-login /opt/uv-python 2>/dev/null || true)
+LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
+      org.opencontainers.image.title="comfyui-mss-login" \
+      org.opencontainers.image.description="ComfyUI with ComfyUI-MSS-Login fetched over HTTPS at build time" \
+      com.monsterspawned.mss-login.revision="${MSS_LOGIN_REF}"
 
 USER comfy
-
 WORKDIR /app/ComfyUI
+EXPOSE 9008
 
-EXPOSE 8188
-
-ENV MSS_LOGIN_DATA_DIR=/data/mss-login \
-    CPE_EMBEDDED_CONVERT=true \
-    DEVICE_TYPE=auto
-
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
-    CMD ["curl", "-f", "http://127.0.0.1:8188/mss-login/login"]
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=300s \
+    CMD ["curl", "-f", "http://127.0.0.1:9008/mss-login/login"]
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: CPU (macOS, CPU-only servers, CI/CD testing)
-# ------------------------------------------------------------------------------
 FROM base AS cpu
 ENV DEVICE_TYPE=cpu \
     USE_CPU=1
@@ -94,36 +114,40 @@ RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
         --index-url https://download.pytorch.org/whl/cpu \
         torch torchvision torchaudio \
-    && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend
+    && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && rm -rf /tmp/uv-cache
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: NVIDIA (Linux & Windows 11 WSL2 with NVIDIA CUDA GPU)
-# ------------------------------------------------------------------------------
 FROM base AS nvidia
-ARG CUDA_VERSION=cu128
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG CUDA_VERSION=cu130
+# Re-derived from the stack 250 cuDNN path for this image's venv layout
+# (/app/ComfyUI/.venv, Debian lib/, no system CUDA prefix). Venv wheels come
+# first so a system cuDNN cannot shadow them. user-scripts/00-setup-uv-venv.sh
+# is not used; that script addresses the old /root/ComfyUI/.venv layout.
 ENV DEVICE_TYPE=cuda \
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility
-RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    LD_LIBRARY_PATH=/app/ComfyUI/.venv/lib/python3.13/site-packages/torch/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/cusparselt/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/app/ComfyUI/.venv/lib/python3.13/site-packages/nvidia/nvshmem/lib
+RUN case "${CUDA_VERSION}" in \
+      cu128|cu130) ;; \
+      *) echo "CUDA_VERSION must be cu128 or cu130" >&2; exit 1 ;; \
+    esac \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
         --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-        --index-url https://download.pytorch.org/whl/${CUDA_VERSION} \
+        --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" \
         torch torchvision torchaudio \
-    && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend
+    && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && rm -rf /tmp/uv-cache
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: ROCM (Linux with AMD ROCm GPU)
-# ------------------------------------------------------------------------------
 FROM base AS rocm
 ARG ROCM_VERSION=rocm6.2.4
 ENV DEVICE_TYPE=rocm
 RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-        --index-url https://download.pytorch.org/whl/${ROCM_VERSION} \
+        --index-url "https://download.pytorch.org/whl/${ROCM_VERSION}" \
         torch torchvision torchaudio \
-    && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend
+    && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && rm -rf /tmp/uv-cache
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: AUTO (Universal hardware auto-detecting image - Default)
-# ------------------------------------------------------------------------------
 FROM base AS auto
 ENV DEVICE_TYPE=auto

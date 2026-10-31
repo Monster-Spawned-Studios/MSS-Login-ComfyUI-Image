@@ -38,6 +38,8 @@ ci-reports
 *.zip
 
 # Local environment configuration & Docker Compose companion overlays
+.env
+.env.local
 deploy/.env
 deploy/.env.local
 deploy/*.env
