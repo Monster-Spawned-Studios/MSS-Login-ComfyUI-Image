@@ -1,35 +1,26 @@
-# Portainer Stack Definition for ComfyUI with MSS-Login
-# Compatible with Portainer Web UI Stack Editor (Standalone Docker and Swarm)
-# Hardware-agnostic: supports NVIDIA CUDA (cu130/cu128), AMD ROCm, Intel Arc/XPU, Apple Metal, or CPU.
-# Supports dedicated sub-image targets: auto, nvidia, rocm, and cpu.
-# Runtime entrypoint auto-detects host hardware and provisions matching PyTorch wheels.
+# Portainer GitOps stack for ComfyUI with MSS-Login.
+# Pulls the NVIDIA image. Nothing in this file builds from the git checkout.
+# Publish ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia only from the
+# manual workflow (.github/workflows/publish-ghcr.yml) with push_nvidia_tag set.
+# Portainer re-pulls that tag on its own schedule.
 #
-# Works out of the box across macOS, Linux, and Windows 11 Pro (WSL2).
+# Container name is comfyui-server (stack 250 ran comfyui-cuda-laptop).
+# Point the Cloudflare tunnel at http://comfyui-server:9008.
+# cloudflared is off unless COMPOSE_PROFILES=tunnel.
+#
+# CPU limits from stack 256: 8 maximum, 4 reserved.
+# The process starts as root so root-owned volume files can be chowned to
+# uid 1000 and so root can seed the MSS-Login tmpfs, then entrypoint.sh drops
+# privileges. The tmpfs is locked root:root before that drop. Watchtower is off.
 
 name: comfyui-mss-server
 
 services:
   comfyui-server:
     init: true
-
-    # --- Hardware Acceleration Companion Extension (Immich-style) ---
-    # To enable hardware acceleration using companion sub-compose files
-    # (modeled after Immich v3.3.5 hwaccel.ml.yml companion scripts),
-    # uncomment the 'extends' block below and choose your target service:
-    # extends:
-    #   file: hwaccel.ml.yml
-    #   service: cuda    # Options: [cuda, rocm, cpu]
-
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: ${IMAGE_TARGET:-auto}
-      args:
-        ACCELERATOR: ${ACCELERATOR:-auto}
-        CUDA_VERSION: ${CUDA_VERSION:-cu128}
-        ROCM_VERSION: ${ROCM_VERSION:-rocm6.2.4}
-    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:latest}
+    image: ${COMFYUI_IMAGE:-ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia}
     container_name: comfyui-server
+    user: "0:0"
     restart: unless-stopped
     shm_size: ${SHM_SIZE:-4g}
     security_opt:
@@ -42,49 +33,98 @@ services:
       - 8.8.8.8
     tty: true
     ports:
-      - "${HOST:-127.0.0.1}:${PORT:-8188}:${PORT:-8188}/tcp"
+      # Tailscale and loopback. Loopback is the host watchdog
+      # (POST http://127.0.0.1:9008/free). The process listens on 0.0.0.0
+      # so both published addresses reach it.
+      - "${COMFYUI_BIND_TAILSCALE:-100.65.194.86}:${COMFYUI_PORT:-9008}:${COMFYUI_PORT:-9008}/tcp"
+      - "127.0.0.1:${COMFYUI_PORT:-9008}:${COMFYUI_PORT:-9008}/tcp"
     environment:
-      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
-      NVIDIA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      HOME: /home/comfy
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0,1}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
-      CLI_ARGS: >-
-        --listen 0.0.0.0 
-        --port ${PORT:-8188} 
-        --enable-cors-header=${CORS:-*} 
-        --front-end-version Comfy-Org/ComfyUI_frontend@${FRONT_END_VERSION:-latest}  
-        --reserve-vram ${VRAM_RESERVE_GB:-1} 
-        --disable-smart-memory
-        ${EXTRA_CLI_ARGS:---use-pytorch-cross-attention --cache-lru 1}
-      HOST_BASE_URL: ${HOST_BASE_URL:-http://${HOST:-127.0.0.1}:${PORT:-8188}}
+      # Fixed container paths. ComfyUI loads models and custom nodes from
+      # /app/ComfyUI, so stack values of MODELS_DIR and NODES_DIR are not read.
+      MODELS_DIR: /app/ComfyUI/models
+      NODES_DIR: /app/ComfyUI/custom_nodes
+      COMFYUI_CUSTOM_NODES_DIR: /app/ComfyUI/custom_nodes
+      # The entrypoint builds the process argv. CLI_ARGS (stack 250) and
+      # EXTRA_CLI_ARGS are the same extra string; both set and different refuses.
+      # Defaults omit --listen and --port when that string already has them.
+      COMFYUI_HOST: ${COMFYUI_HOST:-0.0.0.0}
+      COMFYUI_PORT: ${COMFYUI_PORT:-9008}
+      CORS: ${CORS:-*}
+      VRAM_RESERVE_GB: ${VRAM_RESERVE_GB:-1.5}
+      FRONTEND_VERSION: ${FRONTEND_VERSION:-v1.55.11}
+      STACK_CLI_ARGS: ${CLI_ARGS:-}
+      EXTRA_CLI_ARGS: ${EXTRA_CLI_ARGS:-}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      TZ: ${TZ:-America/Boise}
+      TIME_ZONE: ${TZ:-America/Boise}
+      CIVITAI_TOKEN: ${CIVITAI_TOKEN:-}
+      DEBUG_MODE: ${LOGIN_DEBUG_MODE:-false}
       SECRET_KEY: ${SECRET_KEY:-}
-      MSS_LOGIN_DATA_DIR: ${MSS_LOGIN_DATA_DIR:-/data/mss-login}
+      NTFY_API_KEY: ${NTFY_AUTH_TOKEN:-}
+      HOST_BASE_URL: ${HOST_BASE_URL:-http://127.0.0.1:9008}
+      # MSS-Login reads auto_update from this directory's config.json.
+      # entrypoint.sh forces enabled=true and mode=notify. There is no stack
+      # variable for that block. In-place Update now is refused by the image patch.
+      MSS_LOGIN_DATA_DIR: ${MSS_DATA_DIR:-/data/mss-login}
+      POSTGRES_HOST: ${POST_HOST:-}
+      POSTGRES_PORT: ${POST_PORT:-}
+      POSTGRES_DATABASE: ${POST_DB:-}
+      POSTGRES_USER: ${POST_USER:-}
+      POSTGRES_PASSWORD: ${POST_PASS:-}
+      COMFYUI_COPILOT_PREFER_OPENAI_AGENTS: ${PREFER_OPENAI_AGENTS:-1}
+      # LD_LIBRARY_PATH is not set in the stack. Root unsets it. After setpriv,
+      # the entrypoint points uid 1000 at the venv CUDA/cuDNN libraries.
+      HF_HOME: /home/comfy/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /home/comfy/.cache/huggingface/hub
+      TORCH_HOME: /home/comfy/.cache/torch
       CPE_EMBEDDED_CONVERT: ${CPE_EMBEDDED_CONVERT:-true}
       EXPERIMENTAL_LOGIN_BACKGROUND: ${EXPERIMENTAL_LOGIN_BACKGROUND:-true}
       WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
       WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-ComfyUI MSS-Login}
       WEBAUTHN_ORIGINS: ${WEBAUTHN_ORIGINS:-}
       PYTHONUNBUFFERED: ${PYTHONUNBUFFERED:-1}
-      DEVICE_TYPE: ${DEVICE_TYPE:-auto}
+      DEVICE_TYPE: ${DEVICE_TYPE:-cuda}
       USE_CPU: ${USE_CPU:-0}
       FORCE_REINSTALL_TORCH: ${FORCE_REINSTALL_TORCH:-0}
-      COMFYUI_COPILOT_PREFER_OPENAI_AGENTS: ${PREFER_OPENAI_AGENTS:-1}
-
+      INSTALL_CUSTOM_NODE_DEPS: ${INSTALL_CUSTOM_NODE_DEPS:-true}
     volumes:
-      - ${COMFYUI_MSS_DATA_DIR:-mss_login_data}:${MSS_LOGIN_DATA_DIR:-/data/mss-login}
-      - ${COMFYUI_MODELS_DIR:-comfyui_models}:/app/ComfyUI/models
-      - ${COMFYUI_OUTPUT_DIR:-comfyui_output}:/app/ComfyUI/output
-      - ${COMFYUI_INPUT_DIR:-comfyui_input}:/app/ComfyUI/input
-      - ${COMFYUI_USER_DIR:-comfyui_user}:/app/ComfyUI/user
-      - ${COMFYUI_CUSTOM_NODES_DIR:-comfyui_custom_nodes}:/app/ComfyUI/custom_nodes
-      - ${COMFYUI_VENV_DIR:-comfyui_venv}:/app/ComfyUI/.venv
+      - ${COMFYUI_USER_SCRIPTS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/user-scripts}:/home/comfy/user-scripts:rw
+      - ${COMFYUI_MODELS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/models}:/app/ComfyUI/models:rw
+      - ${COMFYUI_CUSTOM_NODES_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/nodes}:/app/ComfyUI/custom_nodes:rw
+      - ${COMFYUI_OUTPUT_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/output}:/app/ComfyUI/output:rw
+      - ${COMFYUI_INPUT_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/input}:/app/ComfyUI/input:rw
+      - ${COMFYUI_USER_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/user}:/app/ComfyUI/user:rw
+      - ${COMFYUI_MSS_DATA_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/mss-data}:${MSS_DATA_DIR:-/data/mss-login}:rw
+      - ${COMFYUI_EXTRA_MODEL_PATHS:-/mnt/tmd-secure/Data/Docker/ComfyUI/extra_model_paths.yaml}:/app/ComfyUI/extra_model_paths.yaml:ro
+      - ${COMFYUI_BASHRC:-/mnt/tmd-secure/Data/Docker/ComfyUI/.bashrc}:/home/comfy/.bashrc:rw
+      - ${COMFYUI_HF_CACHE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/hf-cache}:/home/comfy/.cache/huggingface/hub:rw
+      - ${COMFYUI_TORCH_CACHE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/torch-cache}:/home/comfy/.cache/torch/hub:rw
+      # InstantID and PuLID read ComfyUI's models/insightface. The host directory
+      # already holds antelopev2 and buffalo_l and must exist before deploy.
+      - type: bind
+        source: ${COMFYUI_INSIGHTFACE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface}
+        target: /app/ComfyUI/models/insightface
+        read_only: true
+        bind:
+          create_host_path: false
+    # Nested over the custom_nodes bind, at the folder ComfyUI loads.
+    # No size: a small cap can fail the seed copy. uid 0 keeps the seed
+    # root-owned. noexec is acceptable. The entrypoint refuses to start
+    # unless mountinfo shows this path as tmpfs and empty before seeding.
+    tmpfs:
+      - /app/ComfyUI/custom_nodes/MSS-Login:uid=0,gid=0,mode=0755,noexec,nosuid
     labels:
-      - "com.centurylinklabs.watchtower.enable=${AUTO_UPDATE:-true}"
+      - "com.centurylinklabs.watchtower.enable=${AUTO_UPDATE:-false}"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:${PORT:-8188}/mss-login/login"]
+      test: ["CMD", "/usr/local/bin/mss-login-healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 600s
     deploy:
       resources:
         limits:
@@ -93,55 +133,21 @@ services:
         reservations:
           cpus: "${CPUS:-4}"
           memory: ${MEMORY:-8G}
-          # --- Hardware & GPU Passthrough (Cross-Platform) ---
-          # NVIDIA GPU (Linux / Windows 11 Pro WSL2 with NVIDIA Container Toolkit):
-          # To allocate NVIDIA GPU(s) to ComfyUI, uncomment the 'devices' block below.
-          # NOTE: Keep commented on macOS (Docker Desktop), CPU-only Linux, or AMD/Intel hosts
-          # to prevent Docker deployment errors ('could not select device driver with capabilities [[gpu]]').
-          # devices:
-          #   - driver: nvidia
-          #     count: all
-          #     capabilities: ["gpu"]
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
 
-    # --- AMD ROCm & Intel Arc / XPU Device Passthrough (Linux) ---
-    # Uncomment if running on Linux with AMD or Intel graphics:
-    # devices:
-    #   - /dev/kfd:/dev/kfd      # AMD ROCm
-    #   - /dev/dri:/dev/dri      # AMD ROCm & Intel Arc / QuickSync
-    # group_add:
-    #   - "video"
-    #   - "render"
-
-  comfyui-cloudflare-tunnel:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    container_name: comfyui-cloudflare-tunnel
+  # Opt-in. In Portainer, set stack environment variable COMPOSE_PROFILES=tunnel.
+  # Without that profile this service is not created.
+  comfyui-prod-tunnel:
+    image: cloudflare/cloudflared:2026.10.7@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
     profiles:
       - tunnel
-      - cloudflare
+    restart: always
+    container_name: comfyui-prod-tunnel
     command: tunnel --no-autoupdate --protocol http2 run
     environment:
-      TUNNEL_TOKEN: ${COMFY_TUNNEL_TOKEN}
-
-volumes:
-  mss_login_data:
-    driver: local
-    name: mss_login_data
-  comfyui_models:
-    driver: local
-    name: comfyui_models
-  comfyui_output:
-    driver: local
-    name: comfyui_output
-  comfyui_input:
-    driver: local
-    name: comfyui_input
-  comfyui_user:
-    driver: local
-    name: comfyui_user
-  comfyui_custom_nodes:
-    driver: local
-    name: comfyui_custom_nodes
-  comfyui_venv:
-    driver: local
-    name: comfyui_venv
+      TUNNEL_TOKEN: ${COMFY_TUNNEL_TOKEN:-}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=${AUTO_UPDATE:-false}"

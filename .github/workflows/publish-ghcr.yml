@@ -1,0 +1,129 @@
+# Manual NVIDIA image publish. There is no push, tag, or schedule trigger.
+# MSS_LOGIN_REF is the Dockerfile ARG. This workflow does not override it.
+# Portainer re-pulls ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia,
+# so that tag is pushed only when push_nvidia_tag is set. The input defaults
+# to false. Authentication is the workflow GITHUB_TOKEN (packages: write).
+name: Publish NVIDIA image
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_nvidia_tag:
+        description: "Push the :nvidia tag (the compose default). Leave off unless this image is ready for Portainer to pull."
+        type: boolean
+        default: false
+      tag:
+        description: "Extra tag besides sha-<commit>. Do not use nvidia or latest. Blank pushes only the sha tag."
+        type: string
+        default: ""
+      cuda_version:
+        description: "PyTorch CUDA wheel channel baked into the nvidia target."
+        type: string
+        default: "cu130"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH_NVIDIA_TAG: ${{ inputs.push_nvidia_tag }}
+      EXTRA_TAG: ${{ inputs.tag }}
+      CUDA_VERSION: ${{ inputs.cuda_version }}
+    steps:
+      - name: Checkout
+        # actions/checkout@v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Resolve image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/monster-spawned-studios/comfyui-mss-login"
+
+          case "${CUDA_VERSION}" in
+            cu128|cu130) ;;
+            *)
+              echo "cuda_version must be cu128 or cu130." >&2
+              exit 1
+              ;;
+          esac
+
+          extra="$(printf '%s' "${EXTRA_TAG}" | tr '[:upper:]' '[:lower:]')"
+          if [[ -n "${extra}" && ! "${extra}" =~ ^[a-z0-9_][a-z0-9_.-]{0,127}$ ]]; then
+            echo "tag must be a lowercase Docker tag." >&2
+            exit 1
+          fi
+          if [[ "${extra}" == "latest" ]]; then
+            echo "Refusing to push :latest." >&2
+            exit 1
+          fi
+          if [[ "${extra}" == "nvidia" && "${PUSH_NVIDIA_TAG}" != "true" ]]; then
+            echo "Refusing to push :nvidia while push_nvidia_tag is off." >&2
+            exit 1
+          fi
+
+          sha_tag="sha-${GITHUB_SHA:0:12}"
+          tags=("${image}:${sha_tag}")
+          if [[ -n "${extra}" && "${extra}" != "${sha_tag}" ]]; then
+            tags+=("${image}:${extra}")
+          fi
+          if [[ "${PUSH_NVIDIA_TAG}" == "true" ]]; then
+            already="false"
+            for item in "${tags[@]}"; do
+              if [[ "${item}" == "${image}:nvidia" ]]; then
+                already="true"
+              fi
+            done
+            if [[ "${already}" == "false" ]]; then
+              tags+=("${image}:nvidia")
+            fi
+          fi
+
+          printf 'Tags to push:\n'
+          printf '  %s\n' "${tags[@]}"
+
+          {
+            echo "cuda_version=${CUDA_VERSION}"
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        # docker/setup-buildx-action@v3.12.0
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        # docker/login-action@v3.7.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push nvidia target
+        # docker/build-push-action@v6.19.2
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile
+          target: nvidia
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            CUDA_VERSION=${{ steps.tags.outputs.cuda_version }}
+            MSS_LOGIN_REPO=https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
