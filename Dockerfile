@@ -135,10 +135,10 @@ ARG CUDA_VERSION=cu130
 # (/app/ComfyUI/.venv, Debian lib/, no system CUDA prefix). Venv wheels come
 # first so a system cuDNN cannot shadow them. user-scripts/00-setup-uv-venv.sh
 # is not used; that script addresses the old /root/ComfyUI/.venv layout.
-# onnxruntime-gpu>=1.27 publishes CUDA 13 / cuDNN 9 wheels by default, which
-# matches this stage. insightface, gguf, and opencv-python-headless are the
-# heavy pieces used by IPAdapter, InstantID, and GGUF nodes. The CPU
-# onnxruntime distribution is removed if insightface pulls it in.
+# onnxruntime-gpu==1.31.1 publishes CUDA 13 / cuDNN 9 wheels, which matches
+# this stage. insightface, onnx, gguf, and opencv-python-headless are pinned
+# to exact versions. The CPU onnxruntime distribution is removed if insightface
+# pulls it in. buffalo_l is not downloaded; mount a verified tree instead.
 ENV DEVICE_TYPE=cuda \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
