@@ -39,7 +39,7 @@ docker build --target nvidia \
 - `curl`, used by the healthcheck.
 - NVIDIA stage: PyTorch CUDA wheels and `LD_LIBRARY_PATH` pointed at the venv cuDNN/CUDA libraries (`/app/ComfyUI/.venv/lib/python3.13/site-packages/...`). This replaces `user-scripts/00-setup-uv-venv.sh`, which targeted `/root/ComfyUI/.venv`. The script is still mounted and is not executed.
 - `entrypoint.sh` seeds MSS-Login into `custom_nodes/MSS-Login` only when no copy of the package is already mounted. Detection uses the pyproject name `MSS-Login` or `mss_login.py` (`create_mss_login_middleware`), not the folder name and not the git remote. One existing copy is reused. Two copies refuse to start. The checkout HEAD must equal `/opt/mss-login/REVISION`.
-- NVIDIA stage also installs `onnxruntime-gpu` (CUDA 13 wheels, `>=1.27`), `insightface`, `onnx`, `gguf`, and `opencv-python-headless`, constrained to the baked torch/CUDA pins.
+- NVIDIA stage also installs `onnxruntime-gpu==1.31.1` (CUDA 13 wheels), `insightface==2.1`, `onnx==1.23.2`, `gguf==0.19.0`, and `opencv-python-headless==5.0.0.93`, constrained to the baked torch/CUDA pins.
 - The container starts as root (`user: "0:0"`) so the entrypoint can `chown` root-owned volume data to uid 1000, then drops privileges with `setpriv`. A directory whose top-level owner is already 1000 is not walked again.
 
 ## Portainer
@@ -96,9 +96,11 @@ Requirement lines that are options, nested includes, editable installs, local pa
 
 `comfyui_ryanonyheinside` and `comfyui-supir` have a `requirements.txt` but no verifiable git remote, so they are not on the allowlist. Workflows that import them will fail until that list is updated.
 
-## InsightFace buffalo_l
+## InsightFace models
 
-The image does not download InsightFace models. Mount a tree you have already verified at `/mnt/tmd-secure/Data/Docker/ComfyUI/insightface` (`INSIGHTFACE_HOME=/home/comfy/.insightface`). `buffalo_l` belongs at `models/buffalo_l` inside that directory. The usual upstream archive is `https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip`; check its checksum before unpacking it on the host.
+InstantID and PuLID load faces from ComfyUI's `models/insightface`, not from `INSIGHTFACE_HOME`. The stack bind-mounts the host directory read-only at `/app/ComfyUI/models/insightface`.
+
+The default host path is `/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface`. That directory already holds verified `antelopev2` and `buffalo_l` and must exist before deploy. Compose is set to `create_host_path: false`, so Docker will not create an empty root-owned directory if the path is missing. The entrypoint logs a warning when the mount is missing or empty. The image does not download these packs.
 
 `extra_model_paths.yaml` and `.bashrc` must already be files on the host. Docker creates a directory if a file bind is missing. `extra_model_paths.yaml` is mounted read-only, so the entrypoint cannot change its owner. If it is mode `600` and owned by root, make it readable by uid 1000 on the host (`chmod a+r`).
 
@@ -137,7 +139,7 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `FORCE_REINSTALL_TORCH` | `0` | `FORCE_REINSTALL_TORCH` |
 | `MSS_LOGIN_DIR` | `MSS-Login` | seed folder name; detection does not use it |
 | `INSTALL_CUSTOM_NODE_DEPS` | `true` | `INSTALL_CUSTOM_NODE_DEPS` |
-| `COMFYUI_INSIGHTFACE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/insightface` | host path for a verified buffalo_l tree |
+| `COMFYUI_INSIGHTFACE_DIR` | `/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface` | existing host directory, mounted read-only at `/app/ComfyUI/models/insightface` |
 | `CORS` | `*` | inside `CLI_ARGS` |
 | `VRAM_RESERVE_GB` | `1.5` | inside `CLI_ARGS` (`--reserve-vram`) |
 | `FRONTEND_VERSION` | `latest` | inside `CLI_ARGS` (`--front-end-version`) |

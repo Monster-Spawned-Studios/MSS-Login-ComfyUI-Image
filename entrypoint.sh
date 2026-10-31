@@ -540,8 +540,18 @@ prepare_as_root() {
   ensure_owned /home/comfy/user-scripts
   ensure_owned /home/comfy/.cache/huggingface/hub
   ensure_owned /home/comfy/.cache/torch/hub
-  ensure_owned /home/comfy/.insightface
   ensure_owned /home/comfy/.bashrc file
+}
+
+warn_if_insightface_models_missing() {
+  local dir="/app/ComfyUI/models/insightface"
+  if [[ ! -d "$dir" ]]; then
+    echo "[comfyui-deploy] WARNING: ${dir} is not mounted. InstantID and PuLID load faces from ComfyUI's models/insightface (antelopev2 and buffalo_l). The host directory must already exist; this stack does not create it." >&2
+    return 0
+  fi
+  if ! dir_has_entries "$dir"; then
+    echo "[comfyui-deploy] WARNING: ${dir} is empty. Expected the existing verified antelopev2 and buffalo_l packs. The image does not download them." >&2
+  fi
 }
 
 require_writable() {
@@ -594,6 +604,7 @@ launch_comfyui() {
   require_writable /app/ComfyUI/input
   require_writable /app/ComfyUI/user
 
+  warn_if_insightface_models_missing
   prepare_mss_login
 
   detect_line="$(

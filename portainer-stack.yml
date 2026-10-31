@@ -91,8 +91,6 @@ services:
       # whatever directory it lives in.
       MSS_LOGIN_DIR: ${MSS_LOGIN_DIR:-MSS-Login}
       INSTALL_CUSTOM_NODE_DEPS: ${INSTALL_CUSTOM_NODE_DEPS:-true}
-      # buffalo_l is not downloaded. Mount a verified model tree here.
-      INSIGHTFACE_HOME: /home/comfy/.insightface
     volumes:
       - ${COMFYUI_USER_SCRIPTS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/user-scripts}:/home/comfy/user-scripts:rw
       - ${COMFYUI_MODELS_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/models}:/app/ComfyUI/models:rw
@@ -105,7 +103,14 @@ services:
       - ${COMFYUI_BASHRC:-/mnt/tmd-secure/Data/Docker/ComfyUI/.bashrc}:/home/comfy/.bashrc:rw
       - ${COMFYUI_HF_CACHE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/hf-cache}:/home/comfy/.cache/huggingface/hub:rw
       - ${COMFYUI_TORCH_CACHE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/torch-cache}:/home/comfy/.cache/torch/hub:rw
-      - ${COMFYUI_INSIGHTFACE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/insightface}:/home/comfy/.insightface:rw
+      # InstantID and PuLID read ComfyUI's models/insightface. The host directory
+      # already holds antelopev2 and buffalo_l and must exist before deploy.
+      - type: bind
+        source: ${COMFYUI_INSIGHTFACE_DIR:-/mnt/tmd-secure/Data/Docker/ComfyUI/models/insightface}
+        target: /app/ComfyUI/models/insightface
+        read_only: true
+        bind:
+          create_host_path: false
     labels:
       - "com.centurylinklabs.watchtower.enable=${AUTO_UPDATE:-false}"
     healthcheck:
