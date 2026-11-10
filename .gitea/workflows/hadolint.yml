@@ -42,7 +42,7 @@ jobs:
           set +e
           echo "[hadolint] Running Hadolint linter on Dockerfile..."
           # Pipe Dockerfile directly to avoid DinD volume mount path discrepancies across act-runner setups
-          docker run --rm -i hadolint/hadolint:latest hadolint \
+          docker run --rm -i hadolint/hadolint:v2.12.0@sha256:30a8fd2e785ab6176eed53f74769e04f125afb2f74a6c52aef7d463583b6d45e hadolint \
             --ignore DL3008 \
             --ignore DL3066 \
             - < Dockerfile > ci-reports/hadolint/hadolint-report.txt 2>&1

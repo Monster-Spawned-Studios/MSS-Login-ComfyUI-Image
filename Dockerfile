@@ -51,18 +51,18 @@ RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install -
     && rm -rf /tmp/uv-cache
 
 WORKDIR /opt/mss-login
-RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
+RUN case "${MSS_LOGIN_REPO}" in https://*) ;; *) \
       echo "MSS_LOGIN_REPO must be an https:// URL" >&2; \
-      exit 1; \
-    fi \
-    && if [[ "${MSS_LOGIN_REPO}" == *"@"* ]]; then \
+      exit 1;; \
+    esac \
+    && case "${MSS_LOGIN_REPO}" in *"@"*) \
       echo "MSS_LOGIN_REPO must not embed credentials" >&2; \
-      exit 1; \
-    fi \
-    && if [[ ! "${MSS_LOGIN_REF}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then \
-      echo "MSS_LOGIN_REF must be a 7-40 character commit SHA" >&2; \
-      exit 1; \
-    fi \
+      exit 1;; \
+    esac \
+    && case "${MSS_LOGIN_REF}" in \
+      *[!0-9a-fA-F]*|"") echo "MSS_LOGIN_REF must be a 7-40 character commit SHA" >&2; exit 1 ;; \
+      *) if [ "${#MSS_LOGIN_REF}" -lt 7 ] || [ "${#MSS_LOGIN_REF}" -gt 40 ]; then echo "MSS_LOGIN_REF must be a 7-40 character commit SHA" >&2; exit 1; fi ;; \
+    esac \
     && git init --quiet ComfyUI-MSS-Login \
     && git -C ComfyUI-MSS-Login remote add origin "${MSS_LOGIN_REPO}" \
     && if ! GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch --depth 1 origin "${MSS_LOGIN_REF}"; then \
@@ -71,10 +71,10 @@ RUN if [[ "${MSS_LOGIN_REPO}" != https://* ]]; then \
     fi \
     && git -C ComfyUI-MSS-Login checkout --detach "${MSS_LOGIN_REF}" \
     && got="$(git -C ComfyUI-MSS-Login rev-parse HEAD)" \
-    && if [[ "${got}" != "${MSS_LOGIN_REF}"* ]]; then \
+    && case "${got}" in "${MSS_LOGIN_REF}"*) ;; *) \
       echo "checked out ${got}, wanted ${MSS_LOGIN_REF}" >&2; \
-      exit 1; \
-    fi \
+      exit 1;; \
+    esac \
     && printf '%s\n' "${got}" > /opt/mss-login/REVISION \
     && uv pip install --python /app/ComfyUI/.venv/bin/python -r /opt/mss-login/ComfyUI-MSS-Login/requirements.txt \
     && rm -rf /tmp/uv-cache
@@ -150,31 +150,31 @@ RUN mkdir -p \
     && git -C /opt/mss-login/ComfyUI-MSS-Login apply /opt/mss-login/patches/mss-login-no-inplace-update.patch \
     && printf '%s\n' "mss-login-no-inplace-update.patch" > /opt/mss-login/PATCHES \
     && /usr/local/bin/write-mss-login-manifest.sh /opt/mss-login/ComfyUI-MSS-Login /opt/mss-login/MANIFEST \
-    && if [[ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2.git" && "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2" ]]; then \
+    && if [ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2.git" ] && [ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2" ]; then \
          echo "SAM2_REPO must be https://github.com/facebookresearch/sam2.git" >&2; \
          exit 1; \
        fi \
-    && if [[ "${SAM2_REPO}" == *"@"* ]]; then \
+    && case "${SAM2_REPO}" in *"@"*) \
          echo "SAM2_REPO must not embed credentials" >&2; \
-         exit 1; \
-       fi \
-    && if [[ ! "${SAM2_REF}" =~ ^[0-9a-f]{40}$ ]]; then \
-         echo "SAM2_REF must be a full 40-character lowercase commit SHA" >&2; \
-         exit 1; \
-       fi \
+         exit 1;; \
+       esac \
+    && case "${SAM2_REF}" in \
+         *[!0-9a-f]*|"") echo "SAM2_REF must be a full 40-character lowercase commit SHA" >&2; exit 1 ;; \
+         *) if [ "${#SAM2_REF}" -ne 40 ]; then echo "SAM2_REF must be a full 40-character lowercase commit SHA" >&2; exit 1; fi ;; \
+       esac \
     && git init --quiet /tmp/sam2-src \
     && git -C /tmp/sam2-src remote add origin "${SAM2_REPO}" \
     && GIT_TERMINAL_PROMPT=0 git -C /tmp/sam2-src fetch --depth 1 origin "${SAM2_REF}" \
     && git -C /tmp/sam2-src checkout --detach "${SAM2_REF}" \
     && got="$(git -C /tmp/sam2-src rev-parse HEAD)" \
-    && if [[ "${got}" != "${SAM2_REF}" ]]; then \
+    && if [ "${got}" != "${SAM2_REF}" ]; then \
          echo "sam2 checkout ${got}, wanted ${SAM2_REF}" >&2; \
          exit 1; \
        fi \
     && SAM2_BUILD_CUDA=0 uv build --wheel --out-dir /opt/sam2 /tmp/sam2-src \
     && rm -rf /tmp/sam2-src \
     && whl="$(find /opt/sam2 -maxdepth 1 -type f -name '*.whl' -print)" \
-    && if [[ -z "${whl}" || "$(printf '%s\n' "${whl}" | wc -l)" -ne 1 ]]; then \
+    && if [ -z "${whl}" ] || [ "$(printf '%s\n' "${whl}" | wc -l)" -ne 1 ]; then \
          echo "expected one sam2 wheel in /opt/sam2" >&2; \
          exit 1; \
        fi \
