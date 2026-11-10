@@ -20,7 +20,7 @@ set -o pipefail
 # Manifest & Pinning:
 #   - Every entry MUST specify an exact 64-character SHA-256 checksum.
 #   - Unpinned entries are refused.
-#   - Pickle formats (.ckpt, .pt, .pth, .bin) are allowed ONLY from
+#   - Pickle formats (.ckpt, .pt, .pth, .bin, .pkl, .pickle, .joblib) are allowed ONLY from
 #     huggingface.co or civitai.com (verified after redirects via url_effective).
 #   - Downloads go to "<dest>.part" and are atomically renamed after sha256 check.
 #   - Failed downloads are logged per-entry; startup is never blocked (exits 0).
@@ -63,24 +63,93 @@ for arg in "$@"; do
 done
 
 HASH_CACHE="$MODELS_DIR/.download-hash-cache.tsv"
-HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
-CIVITAI_TOKEN="${CIVITAI_TOKEN:-}"
 
-# Parse size units to integer bytes
-to_bytes() {
-    local val="${1:-0}"
-    case "${val,,}" in
-        *g|*gb) echo "$(( ${val%[gG]*} * 1024 * 1024 * 1024 ))" ;;
-        *m|*mb) echo "$(( ${val%[mM]*} * 1024 * 1024 ))" ;;
-        *k|*kb) echo "$(( ${val%[kK]*} * 1024 ))" ;;
-        *) echo "$val" ;;
-    esac
+# Safe token fallback: read key-value pair from .env without sourcing or eval
+load_token_from_env_file() {
+    local var_name="$1" candidate val
+    for candidate in "${ENV_FILE:-}" "/home/comfy/user-scripts/.env" "/app/ComfyUI/.env" "/data/mss-login/.env" "/data/.env" ".env"; do
+        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+            val="$(grep -E "^[[:space:]]*${var_name}=" "$candidate" 2>/dev/null | tail -n 1 | cut -d= -f2-)"
+            val="$(printf '%s' "$val" | sed -E -e 's/^[[:space:]]*["'"'"']?//' -e 's/["'"'"']?[[:space:]]*$//')"
+            if [ -n "$val" ]; then
+                printf '%s' "$val"
+                return 0
+            fi
+        fi
+    done
+    return 1
 }
 
-MAX_FILESIZE_BYTES="$(to_bytes "${MODELS_MAX_FILESIZE:-53687091200}")" # Default 50GB
+HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "$HF_TOKEN" ]; then
+    HF_TOKEN="$(load_token_from_env_file "HF_TOKEN" || load_token_from_env_file "HUGGING_FACE_HUB_TOKEN" || true)"
+fi
+CIVITAI_TOKEN="${CIVITAI_TOKEN:-}"
+if [ -z "$CIVITAI_TOKEN" ]; then
+    CIVITAI_TOKEN="$(load_token_from_env_file "CIVITAI_TOKEN" || true)"
+fi
+
+# Nit 1: Validate MODELS_MAX_FILESIZE and MODELS_DISK_HEADROOM_KB against ^[0-9]+[KMG]?$
+parse_size_bytes() {
+    local raw="${1:-}" default_val="$2"
+    [ -z "$raw" ] && raw="$default_val"
+    raw="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
+    if ! [[ "$raw" =~ ^[0-9]+[KMG]?$ ]]; then
+        echo "[Models] ⚠ Invalid MODELS_MAX_FILESIZE: '$1'; using default $default_val" >&2
+        raw="$default_val"
+    fi
+    local num unit mult=1
+    if [[ "$raw" =~ ^([0-9]+)([KMG])?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            K) mult=1024 ;;
+            M) mult=$(( 1024 * 1024 )) ;;
+            G) mult=$(( 1024 * 1024 * 1024 )) ;;
+            *) mult=1 ;;
+        esac
+        if [ "$num" -gt 1099511627776 ] 2>/dev/null; then
+            echo 53687091200
+        else
+            echo $(( num * mult ))
+        fi
+    else
+        echo "$default_val"
+    fi
+}
+
+parse_headroom_kb() {
+    local raw="${1:-}" default_val="$2"
+    [ -z "$raw" ] && raw="$default_val"
+    raw="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
+    if ! [[ "$raw" =~ ^[0-9]+[KMG]?$ ]]; then
+        echo "[Models] ⚠ Invalid MODELS_DISK_HEADROOM_KB: '$1'; using default $default_val" >&2
+        raw="$default_val"
+    fi
+    local num unit mult=1
+    if [[ "$raw" =~ ^([0-9]+)([KMG])?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            K) mult=1 ;;
+            M) mult=1024 ;;
+            G) mult=$(( 1024 * 1024 )) ;;
+            *) mult=1 ;;
+        esac
+        if [ "$num" -gt 1073741824 ] 2>/dev/null; then
+            echo 1048576
+        else
+            echo $(( num * mult ))
+        fi
+    else
+        echo "$default_val"
+    fi
+}
+
+MAX_FILESIZE_BYTES="$(parse_size_bytes "${MODELS_MAX_FILESIZE:-}" "53687091200")" # Default 50GB
 MAX_TIME="${MODELS_MAX_TIME:-7200}"
 CONNECT_TIMEOUT="${MODELS_CONNECT_TIMEOUT:-30}"
-DISK_HEADROOM_KB="${MODELS_DISK_HEADROOM_KB:-1048576}" # Default 1GB headroom
+DISK_HEADROOM_KB="$(parse_headroom_kb "${MODELS_DISK_HEADROOM_KB:-}" "1048576")" # Default 1GB headroom
 
 # Strict HTTPS enforcement for curl
 CURL_HTTPS_OPTS=(--proto "=https" --proto-redir "=https" --fail --location)
@@ -155,27 +224,38 @@ local_hash() {  # algo path -> hex (cached by path+size+mtime)
             return 0
         fi
     fi
-    h="$("${algo}sum" -- "$abs" 2>/dev/null | awk '{ print $1 }')" || return 1
+    # Nit 2: Hardcode sha256sum
+    h="$(sha256sum -- "$abs" 2>/dev/null | awk '{ print $1 }')" || return 1
     [ -n "$h" ] || return 1
     cache_put "$algo" "$abs" "$h"
     echo "$h"
 }
 
 # Fetch remote headers and effective URL over HTTPS
+# F1: Inline -H @<(printf ...) to keep process substitution FD alive for curl
 remote_head() {
-    local url="$1" auth="$2" auth_hdr=()
+    local url="$1" auth="$2"
     if [ "$auth" = "hf" ] && [ -n "$HF_TOKEN" ]; then
-        auth_hdr=(-H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN"))
+        curl -sS -I "${CURL_HTTPS_OPTS[@]}" \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time 30 \
+            -H @<(printf 'Authorization: Bearer %s' "$HF_TOKEN") \
+            -w '%{url_effective}' \
+            -- "$url" 2>/dev/null || true
     elif [ "$auth" = "civitai" ] && [ -n "$CIVITAI_TOKEN" ]; then
-        auth_hdr=(-H @<(printf 'Authorization: Bearer %s\n' "$CIVITAI_TOKEN"))
+        curl -sS -I "${CURL_HTTPS_OPTS[@]}" \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time 30 \
+            -H @<(printf 'Authorization: Bearer %s' "$CIVITAI_TOKEN") \
+            -w '%{url_effective}' \
+            -- "$url" 2>/dev/null || true
+    else
+        curl -sS -I "${CURL_HTTPS_OPTS[@]}" \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time 30 \
+            -w '%{url_effective}' \
+            -- "$url" 2>/dev/null || true
     fi
-
-    curl -sS -I "${CURL_HTTPS_OPTS[@]}" \
-        --connect-timeout "$CONNECT_TIMEOUT" \
-        --max-time 30 \
-        "${auth_hdr[@]}" \
-        -w '%{url_effective}' \
-        -- "$url" 2>/dev/null || true
 }
 
 # Extract host from URL
@@ -185,17 +265,10 @@ extract_host() {
 }
 
 # CivitAI: fetch model version info via HTTPS
+# F1: Inline -H @<(printf ...) to keep process substitution FD alive for curl
 civitai_file_info() {
-    local version_id="$1" file_id="$2" auth_hdr=()
-    if [ -n "$CIVITAI_TOKEN" ]; then
-        auth_hdr=(-H @<(printf 'Authorization: Bearer %s\n' "$CIVITAI_TOKEN"))
-    fi
-    curl -sS "${CURL_HTTPS_OPTS[@]}" \
-        --connect-timeout "$CONNECT_TIMEOUT" \
-        --max-time 30 \
-        "${auth_hdr[@]}" \
-        -- "https://civitai.com/api/v1/model-versions/${version_id}" 2>/dev/null \
-    | python3 -c '
+    local version_id="$1" file_id="$2"
+    local py_filter='
 import json, os, sys
 fid = sys.argv[1]
 try:
@@ -203,40 +276,70 @@ try:
 except Exception:
     sys.exit(0)
 files = d.get("files") or []
-f = next((x for x in files if fid and str(x.get("id")) == fid), None)
-if f is None and not fid:
-    f = next((x for x in files if x.get("primary")), files[0] if files else None)
-if f:
-    name = os.path.basename(str(f.get("name") or "")).replace("\t", " ")
-    sha = str((f.get("hashes") or {}).get("SHA256") or "").lower()
+match = None
+if fid:
+    for f in files:
+        if str(f.get("id")) == str(fid):
+            match = f
+            break
+if not match and files:
+    match = files[0]
+if match:
+    name = os.path.basename(str(match.get("name") or "")).replace("\t", " ")
+    sha = str((match.get("hashes") or {}).get("SHA256") or "").lower()
     print(name + "\t" + sha)
-' "$file_id" 2>/dev/null || true
+'
+    if [ -n "$CIVITAI_TOKEN" ]; then
+        curl -sS "${CURL_HTTPS_OPTS[@]}" \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time 30 \
+            -H @<(printf 'Authorization: Bearer %s' "$CIVITAI_TOKEN") \
+            -- "https://civitai.com/api/v1/model-versions/${version_id}" 2>/dev/null \
+        | python3 -c "$py_filter" "$file_id" 2>/dev/null || true
+    else
+        curl -sS "${CURL_HTTPS_OPTS[@]}" \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time 30 \
+            -- "https://civitai.com/api/v1/model-versions/${version_id}" 2>/dev/null \
+        | python3 -c "$py_filter" "$file_id" 2>/dev/null || true
+    fi
 }
 
-# A download name must be a plain file name: no path, no backslash, no control chars, no leading dot or dash
+# Nit 6: Safe filename validation rejecting bidi override/isolate marks and control characters
 safe_filename() {
     local name="$1"
-    if [ -z "$name" ]; then return 1; fi
-    if [[ "$name" == .* || "$name" == */* || "$name" == *"\\"* || "$name" == -* || "$name" =~ [[:cntrl:]] ]]; then
+    [ -z "$name" ] && return 1
+    if [[ "$name" == .* || "$name" == */* || "$name" == *"\\"* || "$name" == -* ]]; then
+        return 1
+    fi
+    if [[ "$name" =~ [[:cntrl:]] ]]; then
+        return 1
+    fi
+    # Check for C0/C1 control characters and Unicode bidi overrides/isolates:
+    # C0 (0x01-0x1F), DEL (0x7F), C1 (\xC2[\x80-\x9F]),
+    # Bidi Marks: U+200E/U+200F (\xE2\x80[\x8E\x8F]), U+202A-U+202E (\xE2\x80[\xAA-\xAE]),
+    # Bidi Isolates: U+2066-U+2069 (\xE2\x81[\xA6-\xA9]), ALM: U+061C (\xD8\x9C)
+    if printf '%s' "$name" | LC_ALL=C grep -qE $'[\x01-\x1f\x7f]|\xc2[\x80-\x9f]|\xe2\x80[\x8e\x8f\xaa-\xae]|\xe2\x81[\xa6-\xa9]|\xd8\x9c' 2>/dev/null; then
         return 1
     fi
     return 0
 }
 
-# Safe destination check
+# Nit 4: Check original destination for symlinks
 safe_dest() {
-    local dest="$1" filename
+    local dest="$1" filename parent
     filename="$(basename -- "$dest")"
+    parent="$(dirname -- "$dest")"
     if ! safe_filename "$filename"; then
         echo "  ⚠ Refusing unsafe file name: $filename" >&2
         return 1
     fi
-    if ! inside_models_dir "$(dirname -- "$dest")"; then
-        echo "  ⚠ Refusing destination outside ${MODELS_DIR}: $dest" >&2
-        return 1
-    fi
     if [ -L "$dest" ] || [ -L "$dest.part" ]; then
         echo "  ⚠ Refusing symlink destination: $dest" >&2
+        return 1
+    fi
+    if ! inside_models_dir "$parent"; then
+        echo "  ⚠ Refusing destination outside ${MODELS_DIR}: $dest" >&2
         return 1
     fi
     return 0
@@ -249,6 +352,9 @@ check_disk_space() {
     avail_kb="$(df -k -- "$target_dir" 2>/dev/null | awk 'NR==2 {print $4}')" || return 0
     if [ -z "$avail_kb" ] || ! [[ "$avail_kb" =~ ^[0-9]+$ ]]; then
         return 0
+    fi
+    if ! [[ "$expected_bytes" =~ ^[0-9]+$ ]]; then
+        expected_bytes=0
     fi
 
     if [ "$expected_bytes" -gt 0 ]; then
@@ -264,11 +370,24 @@ check_disk_space() {
     return 0
 }
 
+# Nit 5: Approved pickle host check
+is_approved_pickle_host() {
+    local h="$1"
+    case "$h" in
+        huggingface.co|*.huggingface.co|civitai.com|*.civitai.com) return 0 ;;
+        127.0.0.1|localhost)
+            [ "${MSS_ALLOW_TEST_HOSTS:-}" = "true" ] && return 0
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # Download file with resume to .part, sha256 check, and atomic rename
+# F1: Inline -H @<(printf ...) to keep process substitution FD alive for curl
 download_file() {
     local url="$1" dest="$2" auth="$3" pinned_sha="$4" expected_size="${5:-0}"
     local part="$dest.part" rc=0 actual_sha=""
-    local auth_hdr=()
 
     safe_dest "$dest" || return 1
 
@@ -291,20 +410,67 @@ download_file() {
     fi
 
     if [ "$auth" = "hf" ] && [ -n "$HF_TOKEN" ]; then
-        auth_hdr=(-H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN"))
+        curl "${CURL_HTTPS_OPTS[@]}" \
+            --retry 3 \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time "$MAX_TIME" \
+            --max-filesize "$MAX_FILESIZE_BYTES" \
+            -C - \
+            -H @<(printf 'Authorization: Bearer %s' "$HF_TOKEN") \
+            -o "$part" \
+            -- "$url" || rc=$?
     elif [ "$auth" = "civitai" ] && [ -n "$CIVITAI_TOKEN" ]; then
-        auth_hdr=(-H @<(printf 'Authorization: Bearer %s\n' "$CIVITAI_TOKEN"))
+        curl "${CURL_HTTPS_OPTS[@]}" \
+            --retry 3 \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time "$MAX_TIME" \
+            --max-filesize "$MAX_FILESIZE_BYTES" \
+            -C - \
+            -H @<(printf 'Authorization: Bearer %s' "$CIVITAI_TOKEN") \
+            -o "$part" \
+            -- "$url" || rc=$?
+    else
+        curl "${CURL_HTTPS_OPTS[@]}" \
+            --retry 3 \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time "$MAX_TIME" \
+            --max-filesize "$MAX_FILESIZE_BYTES" \
+            -C - \
+            -o "$part" \
+            -- "$url" || rc=$?
     fi
 
-    curl "${CURL_HTTPS_OPTS[@]}" \
-        --retry 3 \
-        --connect-timeout "$CONNECT_TIMEOUT" \
-        --max-time "$MAX_TIME" \
-        --max-filesize "$MAX_FILESIZE_BYTES" \
-        -C - \
-        "${auth_hdr[@]}" \
-        -o "$part" \
-        -- "$url" || rc=$?
+    # Nit 7: on junk .part and no range support (curl exit 33), delete only that validated
+    # destination's partial file and retry cleanly once.
+    if [ "$rc" -eq 33 ] && [ -f "$part" ]; then
+        echo "  ⚠ Server does not support resume or .part corrupted (curl exit 33); removing partial file and retrying cleanly once..." >&2
+        rm -f -- "$part"
+        rc=0
+        if [ "$auth" = "hf" ] && [ -n "$HF_TOKEN" ]; then
+            curl "${CURL_HTTPS_OPTS[@]}" \
+                --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time "$MAX_TIME" \
+                --max-filesize "$MAX_FILESIZE_BYTES" \
+                -H @<(printf 'Authorization: Bearer %s' "$HF_TOKEN") \
+                -o "$part" \
+                -- "$url" || rc=$?
+        elif [ "$auth" = "civitai" ] && [ -n "$CIVITAI_TOKEN" ]; then
+            curl "${CURL_HTTPS_OPTS[@]}" \
+                --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time "$MAX_TIME" \
+                --max-filesize "$MAX_FILESIZE_BYTES" \
+                -H @<(printf 'Authorization: Bearer %s' "$CIVITAI_TOKEN") \
+                -o "$part" \
+                -- "$url" || rc=$?
+        else
+            curl "${CURL_HTTPS_OPTS[@]}" \
+                --connect-timeout "$CONNECT_TIMEOUT" \
+                --max-time "$MAX_TIME" \
+                --max-filesize "$MAX_FILESIZE_BYTES" \
+                -o "$part" \
+                -- "$url" || rc=$?
+        fi
+    fi
 
     if [ "$rc" -ne 0 ] || [ ! -s "$part" ]; then
         echo "  ⚠ Failed to download $(sanitize_url "$url") (exit $rc); partial kept at $(sanitize_url "$part") for resume" >&2
@@ -312,7 +478,8 @@ download_file() {
     fi
 
     echo "  Verifying sha256..."
-    actual_sha="$("${algo:-sha256}sum" -- "$part" 2>/dev/null | awk '{ print $1 }')" || actual_sha=""
+    # Nit 2: Hardcode sha256sum
+    actual_sha="$(sha256sum -- "$part" 2>/dev/null | awk '{ print $1 }')" || actual_sha=""
     if [ "$actual_sha" != "$pinned_sha" ]; then
         echo "  ⚠ Checksum mismatch after download (expected $pinned_sha, got ${actual_sha:-unknown}); deleting partial file" >&2
         rm -f -- "$part"
@@ -415,6 +582,9 @@ echo "------------------------------------------------------------"
 declare -A SEEN_MANIFEST=()
 
 while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    # Strip Windows CRLF line endings
+    raw_line="${raw_line%$'\r'}"
+
     # Skip empty lines and comments
     [[ -z "$raw_line" || "$raw_line" =~ ^[[:space:]]*# ]] && continue
 
@@ -476,7 +646,8 @@ while IFS= read -r raw_line || [ -n "$raw_line" ]; do
 
     TARGET_DIR="$(get_target_dir "$model_type")"
     if ! inside_models_dir "$TARGET_DIR"; then
-        echo "[Models] ⚠ Target ${TARGET_DIR} resolves outside ${MODELS_DIR}; skipping: $line" >&2
+        # Nit 3: Sanitize line before printing
+        echo "[Models] ⚠ Target ${TARGET_DIR} resolves outside ${MODELS_DIR}; skipping: $(sanitize_url "$line")" >&2
         continue
     fi
     mkdir -p -- "$TARGET_DIR"
@@ -495,7 +666,8 @@ while IFS= read -r raw_line || [ -n "$raw_line" ]; do
             filename="$(basename -- "$hf_file")"
             auth="hf"
         else
-            echo "[Models] ⚠ HuggingFace whole-repository downloads are unpinned; refusing: $source" >&2
+            # Nit 3: Sanitize source before printing
+            echo "[Models] ⚠ HuggingFace whole-repository downloads are unpinned; refusing: $(sanitize_url "$source")" >&2
             continue
         fi
 
@@ -557,6 +729,12 @@ while IFS= read -r raw_line || [ -n "$raw_line" ]; do
         continue
     fi
 
+    # Nit 4: Check original destination for symlinks BEFORE realpath resolves it
+    if [ -L "$TARGET_DIR/$filename" ] || [ -L "$TARGET_DIR/$filename.part" ]; then
+        echo "  ⚠ Refusing symlink destination: $TARGET_DIR/$filename" >&2
+        continue
+    fi
+
     dest="$(realpath -m -- "$TARGET_DIR/$filename")"
     if ! inside_models_dir "$dest"; then
         echo "  ⚠ Refusing destination outside ${MODELS_DIR}: $dest" >&2
@@ -569,22 +747,24 @@ while IFS= read -r raw_line || [ -n "$raw_line" ]; do
         continue
     fi
 
-    # Pickle formats (.ckpt, .pt, .pth, .bin) restriction
+    # Nit 5: Pickle formats (.ckpt, .pt, .pth, .bin, .pkl, .pickle, .joblib) restriction
     file_ext=".${filename##*.}"
     file_ext="${file_ext,,}"
     case "$file_ext" in
-        .ckpt|.pt|.pth|.bin)
+        .ckpt|.pt|.pth|.bin|.pkl|.pickle|.joblib)
+            url_host="$(extract_host "$url")"
+            if ! is_approved_pickle_host "$url_host"; then
+                echo "[Models] ⚠ Refusing pickle file from disallowed host: $url_host" >&2
+                continue
+            fi
             effective_output="$(remote_head "$url" "$auth")"
             effective_url="${effective_output##*$'\n'}"
             [ -z "$effective_url" ] && effective_url="$url"
             effective_host="$(extract_host "$effective_url")"
-            case "$effective_host" in
-                huggingface.co|civitai.com) ;;
-                *)
-                    echo "[Models] ⚠ Refusing pickle file from disallowed host: $effective_host" >&2
-                    continue
-                    ;;
-            esac
+            if ! is_approved_pickle_host "$effective_host"; then
+                echo "[Models] ⚠ Refusing pickle file from disallowed redirect host: $effective_host" >&2
+                continue
+            fi
             ;;
     esac
 
