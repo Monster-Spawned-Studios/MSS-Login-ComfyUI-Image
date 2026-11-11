@@ -2,7 +2,7 @@
 # Pulls the NVIDIA image. Nothing in this file builds from the git checkout.
 # Publish ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia only from the
 # manual workflow (.github/workflows/publish-ghcr.yml) with push_nvidia_tag set.
-# Portainer re-pulls that tag on its own schedule.
+# Portainer re-pulls that tag only when stack auto-update or re-pull is on.
 #
 # Container name is comfyui-server (stack 250 ran comfyui-cuda-laptop).
 # Point the Cloudflare tunnel at http://comfyui-server:9008.
@@ -19,6 +19,10 @@ services:
   comfyui-server:
     init: true
     image: ${COMFYUI_IMAGE:-ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia}
+    # development b43a28b. This stack has no build section, so "build" is not
+    # valid here. missing (default) pulls only when the image is absent;
+    # always re-pulls on every deploy, which acts like auto-update.
+    pull_policy: ${PULL_POLICY:-missing}
     container_name: comfyui-server
     user: "0:0"
     restart: unless-stopped
@@ -81,6 +85,13 @@ services:
       HF_HOME: /home/comfy/.cache/huggingface
       HUGGINGFACE_HUB_CACHE: /home/comfy/.cache/huggingface/hub
       TORCH_HOME: /home/comfy/.cache/torch
+      XDG_CACHE_HOME: /home/comfy/.cache
+      HF_TOKEN: ${HF_TOKEN:-}
+      # Baked model downloader (development 9dc33b1), run as uid 1000 before
+      # ComfyUI starts. The list is read as data from the user-scripts mount
+      # (models-to-download.txt) or from MODELS_TO_DOWNLOAD. No host script runs.
+      DOWNLOAD_MODELS: ${DOWNLOAD_MODELS:-true}
+      MODELS_TO_DOWNLOAD: ${MODELS_TO_DOWNLOAD:-}
       CPE_EMBEDDED_CONVERT: ${CPE_EMBEDDED_CONVERT:-true}
       EXPERIMENTAL_LOGIN_BACKGROUND: ${EXPERIMENTAL_LOGIN_BACKGROUND:-true}
       WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
@@ -139,7 +150,9 @@ services:
           memory: ${MEMORY:-8G}
           devices:
             - driver: nvidia
-              count: all
+              # development b43a28b: GPU count from the environment.
+              # Pick devices with CUDA_VISIBLE_DEVICES / NVIDIA_VISIBLE_DEVICES.
+              count: ${GPU_COUNT:-all}
               capabilities: ["gpu"]
 
   # Opt-in. In Portainer, set stack environment variable COMPOSE_PROFILES=tunnel.

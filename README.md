@@ -10,10 +10,11 @@ Workflow: `.github/workflows/publish-ghcr.yml`.
 
 - Trigger: `workflow_dispatch` only. No push, tag, or schedule.
 - Auth: the workflow `GITHUB_TOKEN` with `packages: write`. No other secrets.
-- Target: Dockerfile stage `nvidia` (default CUDA channel `cu130`).
-- Every run pushes `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<12 character commit>`.
-- Input `push_nvidia_tag` (boolean, default **off**) also pushes `:nvidia`. Portainer re-pulls `:nvidia`, so leave this off until the image is ready to deploy.
-- `:latest` is refused. Optional input `tag` adds one extra tag and cannot be `latest`.
+- Input `target` (default `nvidia`; also `cpu`, `rocm`, `auto`): the Dockerfile stage to build. The nvidia stage uses CUDA channel `cu130` by default.
+- Every run pushes `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<12 character commit>` (nvidia) or `:sha-<12>-<target>` (other targets).
+- Input `push_nvidia_tag` (boolean, default **off**) also pushes `:nvidia`, and only with `target` `nvidia`. Portainer re-pulls `:nvidia`, so leave this off until the image is ready to deploy.
+- `:latest` and `:cuda` are refused. Optional input `tag` adds one extra tag (for example `cpu` or `rocm` for a local overlay).
+- A final job sends an ntfy notification when the `NTFY_URL` and `NTFY_TOPIC` secrets exist; it is skipped otherwise.
 - There is no workflow input for the MSS-Login pin. `MSS_LOGIN_REF` is the `ARG` default in the Dockerfile. A direct sha fetch is tried first; if that fails, the build fetches `development` and checks out that exact sha.
 
 Build args:
@@ -24,7 +25,7 @@ Build args:
 | `MSS_LOGIN_REF` | `1d9acbcee661088145e0adb38ab1dc829393108f` |
 | `CUDA_VERSION` | `cu130` on the nvidia stage (`cu128` is the other accepted value) |
 
-`cpu`, `rocm`, and `auto` remain Dockerfile targets. Build them locally with `docker build --target cpu` (or `rocm` / `auto`). The workflow does not publish those tags.
+`cpu`, `rocm`, and `auto` remain Dockerfile targets. Build them locally with `docker build --target cpu` (or `rocm` / `auto`), or publish a sha tag with the workflow's `target` input. Only the nvidia image is reviewed for Portainer.
 
 ```bash
 docker build --target nvidia \
@@ -37,9 +38,9 @@ docker build --target nvidia \
 - ComfyUI under `/app/ComfyUI`, Python 3.13 via uv, user `comfy` (uid/gid 1000).
 - ComfyUI-MSS-Login at `/opt/mss-login/ComfyUI-MSS-Login`, owned by root. `/opt/mss-login/MANIFEST` is the sha256 of regular files. `MANIFEST.entries` lists every non-directory (including symlinks and fifos). `MANIFEST.dirs` lists directories. `.git`, `__pycache__`, `.pyc`, and `.pyo` are omitted. `/opt/mss-login/PATCHES` names `mss-login-no-inplace-update.patch` and `mss-login-manager-owner-gate.patch`.
 - ComfyUI-Manager 4.3 at `/opt/comfyui-manager/site`, owned by root, owner-only and read-only. See [ComfyUI-Manager (owner only)](#comfyui-manager-owner-only).
-- `entrypoint.sh`, `update.sh`, `write-torch-constraints.sh`, and `write-mss-login-manifest.sh` are root:root mode `0755` in `/usr/local/bin`. The venv stays uid 1000. There is no `sitecustomize.py`. Root does not source `/home/comfy/.bashrc` or `/etc/profile.d`.
+- `entrypoint.sh`, `update.sh`, `write-torch-constraints.sh`, `write-mss-login-manifest.sh`, `mss-login-healthcheck`, and `mss-download-models` are root:root mode `0755` in `/usr/local/bin`. The venv stays uid 1000. There is no `sitecustomize.py`. Root does not source `/home/comfy/.bashrc` or `/etc/profile.d`.
 - `curl`, used by the healthcheck.
-- NVIDIA stage: PyTorch CUDA wheels and `LD_LIBRARY_PATH` pointed at the venv cuDNN/CUDA libraries (`/app/ComfyUI/.venv/lib/python3.13/site-packages/...`). This replaces `user-scripts/00-setup-uv-venv.sh`, which targeted `/root/ComfyUI/.venv`. The script is still mounted and is not executed.
+- NVIDIA stage: PyTorch CUDA wheels and `LD_LIBRARY_PATH` pointed at the venv cuDNN/CUDA libraries (`/app/ComfyUI/.venv/lib/python3.13/site-packages/...`). This replaces `user-scripts/00-setup-uv-venv.sh`, which targeted `/root/ComfyUI/.venv`. No script in the user-scripts mount is executed; see [Model downloads and user-scripts](#model-downloads-and-user-scripts).
 - The host `custom_nodes/MSS-Login` checkout is not loaded. A tmpfs is mounted on that folder. Root copies the baked tree onto it, locks it `root:root` (`0755` directories, `0644` files), checks the manifest, and only then drops to uid 1000.
 - NVIDIA stage also installs `onnxruntime-gpu==1.31.1` (CUDA 13 wheels), `insightface==2.1`, `onnx==1.23.2`, `gguf==0.19.0`, and `opencv-python-headless==5.0.0.93`, constrained to the baked torch/CUDA pins.
 - sam2 is baked from `https://github.com/facebookresearch/sam2` commit `2b90b9f5ceec907a1c18123530e92e794ad901a4`. The image builds a wheel with `SAM2_BUILD_CUDA=0`, records its sha256 in `/opt/sam2/SHA256`, and installs that wheel with `--require-hashes --no-deps`. `hydra-core==1.3.8` and `iopath==0.1.10` are installed with it. Impact-Pack's `git+https://github.com/facebookresearch/sam2` line is skipped at runtime and the log names the node and the line.
@@ -47,7 +48,11 @@ docker build --target nvidia \
 
 ## Portainer
 
-Compose path: `portainer-stack.yml`. Do not attach the `hwaccel.*.yml` files. GPU passthrough for both devices is already in the stack (`CUDA_VISIBLE_DEVICES` default `0,1`, NVIDIA device reservation `count: all`).
+Compose path: `portainer-stack.yml`. Do not attach the `hwaccel.*.yml` files. GPU passthrough for both devices is already in the stack (`CUDA_VISIBLE_DEVICES` default `0,1`, NVIDIA device reservation `count: ${GPU_COUNT:-all}`). GPU selection is environment-only: set `GPU_COUNT`, `CUDA_VISIBLE_DEVICES`, or `NVIDIA_VISIBLE_DEVICES` in the stack environment instead of editing YAML.
+
+`pull_policy` is `${PULL_POLICY:-missing}`. `missing` pulls only when the image is absent. `always` re-pulls on every deploy, which behaves like auto-update. `build` is not valid here because the stack has no build section.
+
+`COMPOSE_PROFILES` only controls the tunnel (`COMPOSE_PROFILES=tunnel`). There is no hardware profile: the NVIDIA service always starts. For local rocm or cpu runs use `docker compose -f portainer-stack.yml -f hwaccel.rocm.yml up -d` (or `hwaccel.cpu.yml`) with a locally built image.
 
 Runtime defaults: memory limit `20g`, memswap `24g`, CPU limit `8`, CPU reservation `4`, `--cache-lru 1`, `--disable-smart-memory`, `--reserve-vram` from `VRAM_RESERVE_GB` (default `1.5`).
 
@@ -129,8 +134,8 @@ The directory name drops the leading `v`. Set stack `FRONTEND_VERSION` to the sa
 1. Push the MSS-Login commits to `https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git`.
 2. Open a pull request in this repository that changes the `ARG MSS_LOGIN_REF` default in the `Dockerfile` to that full commit sha. That `ARG` is the only pin. `.github/workflows/publish-ghcr.yml` does not take an `mss_login_ref` input and does not pass `MSS_LOGIN_REF` as a build-arg, so a dispatch cannot select a different commit. If `patches/mss-login-no-inplace-update.patch` no longer applies, update that file in the same pull request. Security reviews the pin and the patch.
 3. Merge the pull request to `production`.
-4. Manually run the `Publish NVIDIA image` workflow (`.github/workflows/publish-ghcr.yml`, `workflow_dispatch`). Set the input `push_nvidia_tag` to true to publish `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia`. Every run also pushes the immutable tag `sha-<first 12 characters of GITHUB_SHA>`. Leave `tag` blank unless an extra tag is required. Do not use `latest`.
-5. Redeploy stack 256 in Portainer. The stack image is `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia` (`COMFYUI_IMAGE`). Portainer's scheduled re-pull of that tag (about 24 hours, with force-pull) picks it up, or pull the image and redeploy the stack by hand. Watchtower stays off (`AUTO_UPDATE` default `false`). Confirm `/opt/mss-login/REVISION` is the new sha and that the log contains `MSS-Login shadow` and `mode=notify`. `GET /login` must return 200, 301, or 302.
+4. Manually run the `Publish image` workflow (`.github/workflows/publish-ghcr.yml`, `workflow_dispatch`) with `target` `nvidia`. Set the input `push_nvidia_tag` to true to publish `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia`. Every run also pushes the immutable tag `sha-<first 12 characters of GITHUB_SHA>`. Leave `tag` blank unless an extra tag is required. Do not use `latest`.
+5. Redeploy the ComfyUI stack in Portainer (the new stack created in the Portainer UI with auto-update off; stack 256 was deleted). The stack image is `ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia` (`COMFYUI_IMAGE`). With auto-update off, Portainer does not re-pull on a schedule: pull the image and redeploy the stack by hand. Watchtower stays off (`AUTO_UPDATE` default `false`). Confirm `/opt/mss-login/REVISION` is the new sha and that the log contains `MSS-Login shadow` and `mode=notify`. `GET /login` must return 200, 301, or 302.
 6. Rollback by setting `COMFYUI_IMAGE` to the previous `ghcr.io/monster-spawned-studios/comfyui-mss-login:sha-<12>` tag and redeploying the stack. Do not retag `:nvidia` backward unless that image is the one that should stay current.
 
 ## ComfyUI-Manager (owner only)
@@ -166,6 +171,20 @@ To bump the Manager pin:
 2. Change `COMFYUI_MANAGER_VERSION`, `COMFYUI_MANAGER_REF`, and `COMFYUI_MANAGER_TREE` in the `Dockerfile` together.
 3. Re-run the route enumeration in `scripts/test_manager_owner_gate.py` against the new tree and update both `OWNER_READ_ROUTES` lists (the Manager patch and the MSS-Login patch) if routes changed. Regenerate `patches/comfyui-manager-mss-lockdown.patch` so `git apply --check` passes, and regenerate `config/comfyui-manager-requirements.lock` if Manager's imports changed.
 4. Run `scripts/test-runtime-guards.sh`, `scripts/test-comfyui-manager-guards.sh`, and `scripts/test_manager_owner_gate.py`. Send the delta to Security before merging.
+
+## Model downloads and user-scripts
+
+The host user-scripts directory (`COMFYUI_USER_SCRIPTS_DIR`, mounted at `/home/comfy/user-scripts`) is read as data only. The container never runs `pre-start.sh` or any other script from it.
+
+Before ComfyUI starts, and after the MSS-Login shadow, pin, and custom-node dependency steps, the entrypoint runs the baked `/usr/local/bin/mss-download-models` as uid 1000. It is the development branch's `01-download-models.sh` with these limits:
+
+- It refuses to run as root.
+- It reads `/home/comfy/user-scripts/models-to-download.txt`, or `MODELS_TO_DOWNLOAD` (comma-separated) when set. The format is unchanged (`type:hf:…`, `type:civitai:<version id>`, `type:https://…`). `user-scripts/models-to-download.txt` in this repo is the current list; copy it to the host directory.
+- Every write stays inside `/app/ComfyUI/models`. `MODELS_DOWNLOAD_DIR` outside that folder is ignored. Destinations that resolve outside it, symlinks, and file names with a path or leading dot are refused. The hash cache is `models/.download-hash-cache.tsv`.
+- Checksums from Hugging Face, CivitAI, or the server are verified when published. `HF_TOKEN` goes only to huggingface.co and `CIVITAI_TOKEN` only to civitai.com.
+- Failures are logged and startup continues. `DOWNLOAD_MODELS=false` skips the step. Large first downloads delay startup; the 600s healthcheck start period starts counting at container start.
+
+Not carried from the development user-scripts, because each one runs host-editable code or changes code that ComfyUI loads, outside the pin, the shadow, or the allowlist: `pre-start.sh` (root hook), `00-setup-uv-venv.sh` (replaced by the baked venv), `02-download-nodes.sh` and `custom-nodes.txt` (git clone of nodes), `03-install-node-deps.sh` (replaced by the allowlisted install below), `04-set-permissions.sh` (replaced by the entrypoint's fixed chown list), `05-reapply-multigpu-fp8.sh` (patches node code), and the `sqlalchemy`/`sageattention` upgrade (unpinned pip install).
 
 ## Runtime custom-node dependencies
 
@@ -212,6 +231,8 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `CPUS` | `4` | CPU reservation |
 | `MEMORY` | `8G` | memory reservation |
 | `AUTO_UPDATE` | `false` | Watchtower label on both services |
+| `PULL_POLICY` | `missing` | compose `pull_policy`, not an env var |
+| `GPU_COUNT` | `all` | NVIDIA device reservation count, not an env var |
 | `CUDA_VISIBLE_DEVICES` | `0,1` | `CUDA_VISIBLE_DEVICES` |
 | `NVIDIA_VISIBLE_DEVICES` | `all` | `NVIDIA_VISIBLE_DEVICES` |
 | `NVIDIA_DRIVER_CAPABILITIES` | `compute,utility` | `NVIDIA_DRIVER_CAPABILITIES` |
@@ -229,6 +250,9 @@ Blank means the default. `.env.example` lists the same names with blank values. 
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | `PYTORCH_CUDA_ALLOC_CONF` |
 | `TZ` | `America/Boise` | `TZ` and `TIME_ZONE` |
 | `CIVITAI_TOKEN` | empty | `CIVITAI_TOKEN` |
+| `HF_TOKEN` | empty | `HF_TOKEN` |
+| `DOWNLOAD_MODELS` | `true` | `DOWNLOAD_MODELS` |
+| `MODELS_TO_DOWNLOAD` | empty | `MODELS_TO_DOWNLOAD` |
 | `LOGIN_DEBUG_MODE` | `false` | `DEBUG_MODE` |
 | `SECRET_KEY` | empty | `SECRET_KEY` |
 | `NTFY_AUTH_TOKEN` | empty | `NTFY_API_KEY` |
@@ -271,6 +295,7 @@ Set in the container and not read from the stack environment:
 | `HF_HOME` | `/home/comfy/.cache/huggingface` |
 | `HUGGINGFACE_HUB_CACHE` | `/home/comfy/.cache/huggingface/hub` |
 | `TORCH_HOME` | `/home/comfy/.cache/torch` |
+| `XDG_CACHE_HOME` | `/home/comfy/.cache` |
 
 `NTFY_AUTH_TOKEN` and `POST_HOST` / `POST_PORT` / `POST_DB` / `POST_USER` / `POST_PASS` keep the stack 250 names. The container still sees `NTFY_API_KEY` and `POSTGRES_*`.
 

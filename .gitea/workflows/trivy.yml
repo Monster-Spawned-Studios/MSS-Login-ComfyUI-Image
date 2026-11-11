@@ -45,7 +45,7 @@ jobs:
         run: |
           set +e
           echo "[trivy] Running configuration audit on Dockerfile & Compose files..."
-          docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:latest config \
+          docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:0.59.1@sha256:029e990b328d149bf0a9ffe355919041e1f86192db2df47e217f8a36dd42ceac config \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             /workspace > ci-reports/trivy/trivy-config-report.txt 2>&1
@@ -64,7 +64,7 @@ jobs:
         run: |
           set +e
           echo "[trivy] Running filesystem vulnerability and secret audit..."
-          docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:latest fs \
+          docker run --rm -v "${GITHUB_WORKSPACE}:/workspace" aquasec/trivy:0.59.1@sha256:029e990b328d149bf0a9ffe355919041e1f86192db2df47e217f8a36dd42ceac fs \
             --scanners vuln,secret \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
