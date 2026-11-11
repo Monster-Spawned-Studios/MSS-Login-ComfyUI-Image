@@ -1,99 +1,320 @@
-# Multi-stage hardware-optimized Dockerfile for ComfyUI with MSS-Login
-# Base: Ubuntu 24.04 LTS (Noble Numbat)
+# ComfyUI runtime. ComfyUI-MSS-Login is not in this repository; the image
+# fetches it over HTTPS at build time. The single pin is MSS_LOGIN_REF
+# (development 1d9acbcee661088145e0adb38ab1dc829393108f). The full sha is
+# written to /opt/mss-login/REVISION. The entrypoint does not run the host
+# checkout. It copies this tree onto a root-owned tmpfs and checks MANIFEST.
+# https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login
 #
-# Dedicated Sub-Image Targets:
-#   - cpu:    Pre-baked with PyTorch CPU wheels (macOS, CPU-only servers, CI/CD)
-#   - nvidia: Pre-baked with PyTorch NVIDIA CUDA wheels (cu128 / cu130)
-#   - rocm:   Pre-baked with PyTorch AMD ROCm wheels (rocm6.2.4)
-#   - auto:   Universal hardware auto-detecting image (default)
+# Targets: cpu, nvidia, rocm, auto. The GitHub workflow publishes nvidia only.
 
-ARG BASE_IMAGE=ubuntu:24.04
-FROM ${BASE_IMAGE} AS base
+FROM ubuntu:24.04 AS base
 
-ARG ACCELERATOR=auto
-ARG CUDA_VERSION=auto
+ARG MSS_LOGIN_REPO=https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
+ARG MSS_LOGIN_REF=1d9acbcee661088145e0adb38ab1dc829393108f
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_INSTALL_DIR=/usr/local/bin \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
-    PATH="/app/ComfyUI/.venv/bin:/root/.local/bin:/usr/local/bin:$PATH"
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_TOOL_DIR=/opt/uv-tools \
+    UV_CACHE_DIR=/tmp/uv-cache \
+    VIRTUAL_ENV=/app/ComfyUI/.venv \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    MSS_LOGIN_SEED=/opt/mss-login/ComfyUI-MSS-Login \
+    MSS_LOGIN_DATA_DIR=/data/mss-login \
+    PYTHONPYCACHEPREFIX=/tmp/comfy-pycache \
+    DEVICE_TYPE=auto
 
-# Install system dependencies (libsqlcipher-dev, graphics, media libraries)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    git \
-    build-essential \
-    libsqlcipher-dev \
-    ffmpeg \
-    libgl1 \
-    libglib2.0-0 \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv for fast Python packaging & tool management
+# curl is the container healthcheck client. git fetches the pinned custom node.
+# libsqlcipher-dev builds sqlcipher3 from the pinned requirements.
+# uv installer: https://docs.astral.sh/uv/getting-started/installation/
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
-
-# Install hermetic Python 3.13 and official Comfy-CLI
-RUN uv python install 3.13 \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libsqlcipher-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv python install 3.13 \
     && uv tool install comfy-cli
 
 WORKDIR /app
 
-# Install ComfyUI core
-RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps
+RUN comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI install --version latest --cpu --fast-deps \
+    && rm -rf /tmp/uv-cache
 
-ENV VIRTUAL_ENV=/app/ComfyUI/.venv \
-    PATH="/app/ComfyUI/.venv/bin:$PATH"
+WORKDIR /opt/mss-login
+RUN case "${MSS_LOGIN_REPO}" in https://*) ;; *) \
+      echo "MSS_LOGIN_REPO must be an https:// URL" >&2; \
+      exit 1;; \
+    esac \
+    && case "${MSS_LOGIN_REPO}" in *"@"*) \
+      echo "MSS_LOGIN_REPO must not embed credentials" >&2; \
+      exit 1;; \
+    esac \
+    && case "${MSS_LOGIN_REF}" in \
+      *[!0-9a-fA-F]*|"") echo "MSS_LOGIN_REF must be a 7-40 character commit SHA" >&2; exit 1 ;; \
+      *) if [ "${#MSS_LOGIN_REF}" -lt 7 ] || [ "${#MSS_LOGIN_REF}" -gt 40 ]; then echo "MSS_LOGIN_REF must be a 7-40 character commit SHA" >&2; exit 1; fi ;; \
+    esac \
+    && git init --quiet ComfyUI-MSS-Login \
+    && git -C ComfyUI-MSS-Login remote add origin "${MSS_LOGIN_REPO}" \
+    && if ! GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch --depth 1 origin "${MSS_LOGIN_REF}"; then \
+      echo "Direct fetch of ${MSS_LOGIN_REF} failed; fetching development and checking out that sha." >&2; \
+      GIT_TERMINAL_PROMPT=0 git -C ComfyUI-MSS-Login fetch origin development; \
+    fi \
+    && git -C ComfyUI-MSS-Login checkout --detach "${MSS_LOGIN_REF}" \
+    && got="$(git -C ComfyUI-MSS-Login rev-parse HEAD)" \
+    && case "${got}" in "${MSS_LOGIN_REF}"*) ;; *) \
+      echo "checked out ${got}, wanted ${MSS_LOGIN_REF}" >&2; \
+      exit 1;; \
+    esac \
+    && printf '%s\n' "${got}" > /opt/mss-login/REVISION \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python -r /opt/mss-login/ComfyUI-MSS-Login/requirements.txt \
+    && rm -rf /tmp/uv-cache
 
-# Auto-download MSS-Login extension into custom_nodes from repository
-ARG MSS_LOGIN_REPO=https://github.com/Monster-Spawned-Studios/ComfyUI-MSS-Login.git
-ARG MSS_LOGIN_BRANCH=production
-RUN git clone --depth 1 --branch ${MSS_LOGIN_BRANCH} ${MSS_LOGIN_REPO} /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
+# These stay root:root under /usr/local/bin. The later chown of /app must not
+# cover them: uid 1000 can write the venv, and root executes this entrypoint.
+COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=755 update.sh /usr/local/bin/update.sh
+COPY --chmod=755 scripts/write-torch-constraints.sh /usr/local/bin/write-torch-constraints.sh
+COPY --chmod=755 scripts/write-mss-login-manifest.sh /usr/local/bin/write-mss-login-manifest.sh
+COPY --chmod=755 scripts/mss-login-healthcheck /usr/local/bin/mss-login-healthcheck
+COPY --chmod=755 scripts/mss-download-models.sh /usr/local/bin/mss-download-models
+COPY patches/mss-login-no-inplace-update.patch /opt/mss-login/patches/mss-login-no-inplace-update.patch
+COPY config/custom-node-deps-allowlist.txt /opt/mss-login/custom-node-deps-allowlist.txt
+COPY patches/mss-login-manager-owner-gate.patch /opt/mss-login/patches/mss-login-manager-owner-gate.patch
+COPY patches/comfyui-manager-mss-lockdown.patch /opt/comfyui-manager/patches/comfyui-manager-mss-lockdown.patch
+COPY config/comfyui-manager-requirements.lock /opt/comfyui-manager/requirements.lock
 
-WORKDIR /app/ComfyUI/custom_nodes/ComfyUI-MSS-Login
+# ComfyUI-Manager, owner-only and read-only. Pinned to release tag 4.3. The
+# tag, the commit, and the commit's tree hash must all match before anything
+# is built. patches/comfyui-manager-mss-lockdown.patch is applied with
+# git apply --check first. The wheel is built here, its sha256 is recorded,
+# and it is installed with --require-hashes --no-deps into the root-owned
+# /opt/comfyui-manager/site (not the uid 1000 venv). The entrypoint puts that
+# directory on PYTHONPATH for the uid 1000 ComfyUI process only and checks
+# /opt/comfyui-manager/MANIFEST before setpriv. Manager's own Python imports
+# come from config/comfyui-manager-requirements.lock (exact pins, hashes).
+# Bumping the pin: change VERSION, REF and TREE together, re-check the patch,
+# and send the delta to Security. See README "ComfyUI-Manager (owner only)".
+ARG COMFYUI_MANAGER_REPO=https://github.com/Comfy-Org/ComfyUI-Manager.git
+ARG COMFYUI_MANAGER_VERSION=4.3
+ARG COMFYUI_MANAGER_REF=f764cc0e54ca8cd6e1c6a8ecc005bd574592ca65
+ARG COMFYUI_MANAGER_TREE=b321e15ea7f3fd86bc8f9c0484479a3dc7701721
+RUN if [[ "${COMFYUI_MANAGER_REPO}" != "https://github.com/Comfy-Org/ComfyUI-Manager.git" ]]; then \
+      echo "COMFYUI_MANAGER_REPO must be https://github.com/Comfy-Org/ComfyUI-Manager.git" >&2; \
+      exit 1; \
+    fi \
+    && if [[ ! "${COMFYUI_MANAGER_VERSION}" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then \
+      echo "COMFYUI_MANAGER_VERSION must be a release tag such as 4.3" >&2; \
+      exit 1; \
+    fi \
+    && if [[ ! "${COMFYUI_MANAGER_REF}" =~ ^[0-9a-f]{40}$ || ! "${COMFYUI_MANAGER_TREE}" =~ ^[0-9a-f]{40}$ ]]; then \
+      echo "COMFYUI_MANAGER_REF and COMFYUI_MANAGER_TREE must be full 40-character lowercase SHAs" >&2; \
+      exit 1; \
+    fi \
+    && mkdir -p /opt/comfyui-manager/wheel /opt/comfy-constraints \
+    && /usr/local/bin/write-torch-constraints.sh \
+    && git init --quiet /tmp/comfyui-manager-src \
+    && git -C /tmp/comfyui-manager-src remote add origin "${COMFYUI_MANAGER_REPO}" \
+    && GIT_TERMINAL_PROMPT=0 git -C /tmp/comfyui-manager-src fetch --depth 1 origin \
+         "${COMFYUI_MANAGER_REF}" "+refs/tags/${COMFYUI_MANAGER_VERSION}:refs/tags/${COMFYUI_MANAGER_VERSION}" \
+    && git -C /tmp/comfyui-manager-src checkout --quiet --detach "${COMFYUI_MANAGER_REF}" \
+    && got="$(git -C /tmp/comfyui-manager-src rev-parse HEAD)" \
+    && tag_commit="$(git -C /tmp/comfyui-manager-src rev-parse "refs/tags/${COMFYUI_MANAGER_VERSION}^{commit}")" \
+    && tree="$(git -C /tmp/comfyui-manager-src rev-parse 'HEAD^{tree}')" \
+    && if [[ "${got}" != "${COMFYUI_MANAGER_REF}" || "${tag_commit}" != "${COMFYUI_MANAGER_REF}" ]]; then \
+      echo "ComfyUI-Manager checkout ${got} / tag ${COMFYUI_MANAGER_VERSION} -> ${tag_commit}, wanted ${COMFYUI_MANAGER_REF}" >&2; \
+      exit 1; \
+    fi \
+    && if [[ "${tree}" != "${COMFYUI_MANAGER_TREE}" ]]; then \
+      echo "ComfyUI-Manager tree ${tree}, wanted ${COMFYUI_MANAGER_TREE}" >&2; \
+      exit 1; \
+    fi \
+    && grep -qx "version = \"${COMFYUI_MANAGER_VERSION}\"" /tmp/comfyui-manager-src/pyproject.toml \
+    && git -C /tmp/comfyui-manager-src apply --check /opt/comfyui-manager/patches/comfyui-manager-mss-lockdown.patch \
+    && git -C /tmp/comfyui-manager-src apply /opt/comfyui-manager/patches/comfyui-manager-mss-lockdown.patch \
+    && rm -rf /tmp/comfyui-manager-src/.git \
+    && uv build --wheel --out-dir /opt/comfyui-manager/wheel /tmp/comfyui-manager-src \
+    && rm -rf /tmp/comfyui-manager-src \
+    && whl="$(find /opt/comfyui-manager/wheel -maxdepth 1 -type f -name 'comfyui_manager-*.whl' -print)" \
+    && if [[ -z "${whl}" || "$(printf '%s\n' "${whl}" | wc -l)" -ne 1 ]]; then \
+      echo "expected one comfyui_manager wheel" >&2; \
+      exit 1; \
+    fi \
+    && sha256sum "${whl}" | awk '{print $1}' > /opt/comfyui-manager/WHEEL_SHA256 \
+    && printf 'comfyui-manager @ file://%s --hash=sha256:%s\n' "${whl}" "$(tr -d '[:space:]' < /opt/comfyui-manager/WHEEL_SHA256)" > /opt/comfyui-manager/wheel-requirements.txt \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python --target /opt/comfyui-manager/site \
+         --no-deps --require-hashes -r /opt/comfyui-manager/wheel-requirements.txt \
+    && test -f /opt/comfyui-manager/site/comfyui_manager/mss_lockdown.py \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
+         --constraint /opt/comfy-constraints/torch.txt \
+         --no-deps --require-hashes -r /opt/comfyui-manager/requirements.lock \
+    && printf '%s\n' "${COMFYUI_MANAGER_VERSION}" > /opt/comfyui-manager/VERSION \
+    && printf '%s\n' "${COMFYUI_MANAGER_REF}" > /opt/comfyui-manager/REVISION \
+    && printf '%s\n' "${COMFYUI_MANAGER_TREE}" > /opt/comfyui-manager/TREE \
+    && printf '%s\n' "comfyui-manager-mss-lockdown.patch" > /opt/comfyui-manager/PATCHES \
+    && /usr/local/bin/write-mss-login-manifest.sh /opt/comfyui-manager/site /opt/comfyui-manager/MANIFEST \
+    && rm -rf /tmp/uv-cache
 
-# Install non-backend-specific extension dependencies
-RUN uv pip install -r requirements.txt \
-    && (playwright install --with-deps chromium || true)
+# facebookresearch/sam2 main at the time of this pin. The wheel is built in
+# this stage with CUDA extensions off, hash-checked, and installed with
+# --require-hashes. Impact-Pack's git+ line is dropped at runtime.
+ARG SAM2_REPO=https://github.com/facebookresearch/sam2.git
+ARG SAM2_REF=2b90b9f5ceec907a1c18123530e92e794ad901a4
+# ComfyUI app/frontend_management.py (0dbfd493) uses
+# web_custom_versions/<owner>_<repo>/<version without v> and skips the GitHub
+# download when that directory already exists.
+ARG COMFYUI_FRONTEND_VERSION=v1.55.11
+ARG COMFYUI_FRONTEND_SHA256=37fac946be14a9cd96ec3fc0dd92fca826c24093c11e1e7184262f8a187f1071
+ARG DOTENVX_VERSION=v2.38.2
+ARG DOTENVX_SHA256=18196e97e94124de756cc728a1472bc242c81d9760733880522471f81484454e
 
-# Provide entrypoint, update script, and default user-scripts inside container
-COPY entrypoint.sh /app/entrypoint.sh
-COPY update.sh /app/update.sh
-COPY user-scripts/ /app/user-scripts/
-RUN chmod +x /app/entrypoint.sh /app/update.sh /app/user-scripts/*.sh 2>/dev/null || true
+RUN mkdir -p \
+        /data/mss-login \
+        /app/ComfyUI/custom_nodes \
+        /app/ComfyUI/input \
+        /app/ComfyUI/models \
+        /app/ComfyUI/output \
+        /app/ComfyUI/user \
+        /app/ComfyUI/temp \
+        /opt/comfy-frontend \
+    && curl -fsSL -o /tmp/frontend-dist.zip \
+        "https://github.com/Comfy-Org/ComfyUI_frontend/releases/download/${COMFYUI_FRONTEND_VERSION}/dist.zip" \
+    && echo "${COMFYUI_FRONTEND_SHA256}  /tmp/frontend-dist.zip" | sha256sum -c - \
+    && frontend_dir="/app/ComfyUI/web_custom_versions/Comfy-Org_ComfyUI_frontend/${COMFYUI_FRONTEND_VERSION#v}" \
+    && mkdir -p "${frontend_dir}" \
+    && /app/ComfyUI/.venv/bin/python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' /tmp/frontend-dist.zip "${frontend_dir}" \
+    && rm -f /tmp/frontend-dist.zip \
+    && printf '%s\n' "${COMFYUI_FRONTEND_VERSION}" > /opt/comfy-frontend/VERSION \
+    && printf '%s\n' "${COMFYUI_FRONTEND_SHA256}" > /opt/comfy-frontend/SHA256 \
+    && curl -fsSL -o /tmp/dotenvx.tar.gz \
+        "https://github.com/dotenvx/dotenvx/releases/download/${DOTENVX_VERSION}/dotenvx-${DOTENVX_VERSION#v}-linux-x86_64.tar.gz" \
+    && echo "${DOTENVX_SHA256}  /tmp/dotenvx.tar.gz" | sha256sum -c - \
+    && dotenvx_tmp="$(mktemp -d)" \
+    && tar -xzf /tmp/dotenvx.tar.gz -C "${dotenvx_tmp}" \
+    && mv "${dotenvx_tmp}/dotenvx" /usr/local/bin/dotenvx \
+    && rm -rf "${dotenvx_tmp}" /tmp/dotenvx.tar.gz \
+    && chmod 1777 /tmp \
+    && test "$(stat -c %a /tmp)" = "1777" \
+    && chown root:root /usr/local/bin/dotenvx \
+    && chmod 755 /usr/local/bin/dotenvx \
+    && (getent group comfy >/dev/null || groupadd --gid 1000 comfy) \
+    && (id -u comfy >/dev/null 2>&1 || useradd --uid 1000 --gid 1000 --create-home --home-dir /home/comfy --shell /bin/bash comfy) \
+    && (getent group render >/dev/null || groupadd --system render) \
+    && usermod -aG video,render comfy \
+    && mkdir -p \
+        /home/comfy/.cache/huggingface/hub \
+        /home/comfy/.cache/torch/hub \
+        /home/comfy/user-scripts \
+        /opt/comfy-constraints \
+        /tmp/comfy-pycache \
+    && chown 1000:1000 /tmp/comfy-pycache \
+    && chmod 0700 /tmp/comfy-pycache \
+    && /usr/local/bin/write-torch-constraints.sh \
+    && cp /opt/mss-login/REVISION /app/ComfyUI/.venv/.mss-build-id \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply --check /opt/mss-login/patches/mss-login-no-inplace-update.patch \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply /opt/mss-login/patches/mss-login-no-inplace-update.patch \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply --check /opt/mss-login/patches/mss-login-manager-owner-gate.patch \
+    && git -C /opt/mss-login/ComfyUI-MSS-Login apply /opt/mss-login/patches/mss-login-manager-owner-gate.patch \
+    && printf '%s\n' "mss-login-no-inplace-update.patch" "mss-login-manager-owner-gate.patch" > /opt/mss-login/PATCHES \
+    && /usr/local/bin/write-mss-login-manifest.sh /opt/mss-login/ComfyUI-MSS-Login /opt/mss-login/MANIFEST \
+    && if [ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2.git" ] && [ "${SAM2_REPO}" != "https://github.com/facebookresearch/sam2" ]; then \
+         echo "SAM2_REPO must be https://github.com/facebookresearch/sam2.git" >&2; \
+         exit 1; \
+       fi \
+    && case "${SAM2_REPO}" in *"@"*) \
+         echo "SAM2_REPO must not embed credentials" >&2; \
+         exit 1;; \
+       esac \
+    && case "${SAM2_REF}" in \
+         *[!0-9a-f]*|"") echo "SAM2_REF must be a full 40-character lowercase commit SHA" >&2; exit 1 ;; \
+         *) if [ "${#SAM2_REF}" -ne 40 ]; then echo "SAM2_REF must be a full 40-character lowercase commit SHA" >&2; exit 1; fi ;; \
+       esac \
+    && git init --quiet /tmp/sam2-src \
+    && git -C /tmp/sam2-src remote add origin "${SAM2_REPO}" \
+    && GIT_TERMINAL_PROMPT=0 git -C /tmp/sam2-src fetch --depth 1 origin "${SAM2_REF}" \
+    && git -C /tmp/sam2-src checkout --detach "${SAM2_REF}" \
+    && got="$(git -C /tmp/sam2-src rev-parse HEAD)" \
+    && if [ "${got}" != "${SAM2_REF}" ]; then \
+         echo "sam2 checkout ${got}, wanted ${SAM2_REF}" >&2; \
+         exit 1; \
+       fi \
+    && SAM2_BUILD_CUDA=0 uv build --wheel --out-dir /opt/sam2 /tmp/sam2-src \
+    && rm -rf /tmp/sam2-src \
+    && whl="$(find /opt/sam2 -maxdepth 1 -type f -name '*.whl' -print)" \
+    && if [ -z "${whl}" ] || [ "$(printf '%s\n' "${whl}" | wc -l)" -ne 1 ]; then \
+         echo "expected one sam2 wheel in /opt/sam2" >&2; \
+         exit 1; \
+       fi \
+    && sha256sum "${whl}" | awk '{print $1}' > /opt/sam2/SHA256 \
+    && printf '%s  %s\n' "$(tr -d '[:space:]' < /opt/sam2/SHA256)" "${whl}" > /opt/sam2/SHA256SUMS \
+    && sha256sum -c /opt/sam2/SHA256SUMS \
+    && printf 'SAM-2 @ file://%s --hash=sha256:%s\n' "${whl}" "$(tr -d '[:space:]' < /opt/sam2/SHA256)" > /opt/sam2/requirements.txt \
+    && printf '%s\n' "${SAM2_REF}" > /opt/sam2/REVISION \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python --no-deps --require-hashes -r /opt/sam2/requirements.txt \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
+         --constraint /opt/comfy-constraints/torch.txt \
+         "hydra-core==1.3.8" \
+         "iopath==0.1.10" \
+    && rm -rf /tmp/uv-cache \
+    && chown -R 1000:1000 /app /data/mss-login /home/comfy /opt/uv-python /opt/uv-tools /opt/comfy-constraints \
+    && chown root:root /app /app/ComfyUI \
+    && chmod 755 /app /app/ComfyUI \
+    && chown -R root:root /app/ComfyUI/web_custom_versions /opt/comfy-frontend \
+    && find /app/ComfyUI/web_custom_versions /opt/comfy-frontend -type d -exec chmod 755 {} + \
+    && find /app/ComfyUI/web_custom_versions /opt/comfy-frontend -type f -exec chmod 644 {} + \
+    && chown -R root:root /opt/mss-login /opt/sam2 /opt/comfyui-manager \
+    && find /opt/mss-login /opt/sam2 /opt/comfyui-manager -type d -exec chmod 0755 {} + \
+    && find /opt/mss-login /opt/sam2 /opt/comfyui-manager -type f -exec chmod 0644 {} + \
+    && chown root:root \
+        /usr/local/bin/entrypoint.sh \
+        /usr/local/bin/update.sh \
+        /usr/local/bin/write-torch-constraints.sh \
+        /usr/local/bin/write-mss-login-manifest.sh \
+        /usr/local/bin/mss-login-healthcheck \
+        /usr/local/bin/mss-download-models \
+    && chmod 755 \
+        /usr/local/bin/entrypoint.sh \
+        /usr/local/bin/update.sh \
+        /usr/local/bin/write-torch-constraints.sh \
+        /usr/local/bin/write-mss-login-manifest.sh \
+        /usr/local/bin/mss-login-healthcheck \
+        /usr/local/bin/mss-download-models
+# Root does not source /home/comfy/.bashrc or /etc/profile.d. No sitecustomize
+# is installed. The venv is uid 1000, including any .pth a later pip install
+# writes; startup python passes --check-hash-based-pycs always and the config
+# writer uses python -S so a venv sitecustomize is not imported as root.
 
-# Create dedicated non-root user 'comfy', data directory, user-scripts, and cache directories with proper ownership
-RUN mkdir -p /data/mss-login /data/cache/huggingface /data/cache/torch /app/user-scripts \
-    && (groupadd -r -g 1000 comfy || true) \
-    && (useradd -m -u 1000 -g 1000 -s /bin/bash comfy || true) \
-    && (groupadd -r render 2>/dev/null || true) \
-    && (usermod -aG video,render comfy 2>/dev/null || usermod -aG video comfy 2>/dev/null || true) \
-    && (chown -R 1000:1000 /app /data/mss-login /data/cache /opt/uv-python 2>/dev/null || true)
+# Hugging Face, Torch, and general caches (development b43a28b). These paths
+# match the stack's cache bind mounts under /home/comfy/.cache. Set after the
+# build steps so no root-owned cache directory is created there.
+ENV HF_HOME=/home/comfy/.cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/home/comfy/.cache/huggingface/hub \
+    TORCH_HOME=/home/comfy/.cache/torch \
+    XDG_CACHE_HOME=/home/comfy/.cache
+
+LABEL org.opencontainers.image.source="https://github.com/Monster-Spawned-Studios/MSS-Login-ComfyUI-Image" \
+      org.opencontainers.image.title="comfyui-mss-login" \
+      org.opencontainers.image.description="ComfyUI with ComfyUI-MSS-Login fetched over HTTPS at build time" \
+      com.monsterspawned.mss-login.revision="${MSS_LOGIN_REF}"
 
 USER comfy
-
 WORKDIR /app/ComfyUI
+EXPOSE 9008
 
-EXPOSE 8188
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=600s \
+    CMD ["/usr/local/bin/mss-login-healthcheck"]
 
-ENV MSS_LOGIN_DATA_DIR=/data/mss-login \
-    HF_HOME=/data/cache/huggingface \
-    TORCH_HOME=/data/cache/torch \
-    XDG_CACHE_HOME=/data/cache \
-    COMFYUI_USER_SCRIPTS_DIR=/app/user-scripts \
-    CPE_EMBEDDED_CONVERT=true \
-    DEVICE_TYPE=auto
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
-    CMD ["curl", "-f", "http://127.0.0.1:8188/mss-login/login"]
-
-ENTRYPOINT ["/app/entrypoint.sh"]
-
-# ------------------------------------------------------------------------------
-# Sub-Image Target: CPU (macOS, CPU-only servers, CI/CD testing)
-# ------------------------------------------------------------------------------
 FROM base AS cpu
 ENV DEVICE_TYPE=cpu \
     USE_CPU=1
@@ -101,36 +322,62 @@ RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
         --index-url https://download.pytorch.org/whl/cpu \
         torch torchvision torchaudio \
-    && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend
+    && echo "cpu" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && /usr/local/bin/write-torch-constraints.sh \
+    && rm -rf /tmp/uv-cache
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: NVIDIA (Linux & Windows 11 WSL2 with NVIDIA CUDA GPU)
-# ------------------------------------------------------------------------------
 FROM base AS nvidia
-ARG CUDA_VERSION=cu128
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG CUDA_VERSION=cu130
+# Re-derived from the stack 250 cuDNN path for this image's venv layout
+# (/app/ComfyUI/.venv, Debian lib/, no system CUDA prefix). Venv wheels come
+# first so a system cuDNN cannot shadow them. user-scripts/00-setup-uv-venv.sh
+# is not used; that script addresses the old /root/ComfyUI/.venv layout.
+# onnxruntime-gpu==1.31.1 publishes CUDA 13 / cuDNN 9 wheels, which matches
+# this stage. insightface, onnx, gguf, and opencv-python-headless are pinned
+# to exact versions. The CPU onnxruntime distribution is removed if insightface
+# pulls it in. buffalo_l is not downloaded; mount a verified tree instead.
+# sam2 is already installed in the base stage from commit
+# 2b90b9f5ceec907a1c18123530e92e794ad901a4 (wheel sha256 recorded at
+# /opt/sam2/SHA256). This stage does not reinstall it.
+# LD_LIBRARY_PATH is not set in this image. Root unsets it. uid 1000 sets it
+# from the venv after setpriv.
 ENV DEVICE_TYPE=cuda \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
-RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
+RUN case "${CUDA_VERSION}" in \
+      cu128|cu130) ;; \
+      *) echo "CUDA_VERSION must be cu128 or cu130" >&2; exit 1 ;; \
+    esac \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
         --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-        --index-url https://download.pytorch.org/whl/${CUDA_VERSION} \
+        --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" \
         torch torchvision torchaudio \
-    && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend
+    && echo "cuda" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && /usr/local/bin/write-torch-constraints.sh \
+    && uv pip install --python /app/ComfyUI/.venv/bin/python \
+        --constraint /opt/comfy-constraints/torch.txt \
+        --only-binary torch,torchvision,torchaudio,onnxruntime-gpu,onnx,gguf,opencv-python-headless,insightface \
+        "onnxruntime-gpu==1.31.1" \
+        "onnx==1.23.2" \
+        "insightface==2.1" \
+        "gguf==0.19.0" \
+        "opencv-python-headless==5.0.0.93" \
+    && if uv pip show --python /app/ComfyUI/.venv/bin/python onnxruntime >/dev/null 2>&1; then \
+      uv pip uninstall --python /app/ComfyUI/.venv/bin/python onnxruntime; \
+    fi \
+    && rm -rf /tmp/uv-cache
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: ROCM (Linux with AMD ROCm GPU)
-# ------------------------------------------------------------------------------
 FROM base AS rocm
 ARG ROCM_VERSION=rocm6.2.4
 ENV DEVICE_TYPE=rocm
 RUN uv pip install --python /app/ComfyUI/.venv/bin/python \
         --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-        --index-url https://download.pytorch.org/whl/${ROCM_VERSION} \
+        --index-url "https://download.pytorch.org/whl/${ROCM_VERSION}" \
         torch torchvision torchaudio \
-    && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend
+    && echo "rocm" > /app/ComfyUI/.venv/.mss_torch_backend \
+    && /usr/local/bin/write-torch-constraints.sh \
+    && rm -rf /tmp/uv-cache
 
-# ------------------------------------------------------------------------------
-# Sub-Image Target: AUTO (Universal hardware auto-detecting image - Default)
-# ------------------------------------------------------------------------------
 FROM base AS auto
 ENV DEVICE_TYPE=auto

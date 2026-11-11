@@ -1,24 +1,10 @@
-# CPU Execution Mode Overlay for ComfyUI MSS-Login
-# macOS (Docker Desktop), CPU-only Linux/WSL2 hosts, and lightweight development
-#
-# Usage:
-#   docker compose -f portainer-stack.yml -f hwaccel.cpu.yml up -d
-# Or in portainer-stack.yml:
-#   extends:
-#     file: hwaccel.cpu.yml
-#     service: comfyui-server
-
+# Optional CPU overlay for a locally built cpu target.
+# Not used by Portainer. The publish workflow does not push :cpu.
+#   docker build --target cpu -t ghcr.io/monster-spawned-studios/comfyui-mss-login:cpu .
 services:
   comfyui-server:
-    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:cpu}
-    pull_policy: ${PULL_POLICY:-build}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: cpu
-      args:
-        ACCELERATOR: cpu
+    image: ghcr.io/monster-spawned-studios/comfyui-mss-login:cpu
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: cpu
-      USE_CPU: 1
-
+      USE_CPU: "1"

@@ -1,28 +1,15 @@
-# Hardware Acceleration Configuration for ComfyUI MSS-Login
-# Modeled after Immich's hwaccel.ml.yml companion structure:
-# https://github.com/immich-app/immich/releases/tag/v3.3.5
-#
-# Usage in main compose file (portainer-stack.yml or docker-compose.yml):
-#   extends:
-#     file: hwaccel.ml.yml
-#     service: cuda    # Options: [cuda, rocm, cpu]
-
+# Optional local hardware overlays. Not used by Portainer GitOps.
+# cpu, rocm, and auto stay as Dockerfile targets. Only :nvidia is published,
+# and only when the manual workflow's push_nvidia_tag input is set.
 name: comfyui-mss-hwaccel
 
 services:
   cuda:
-    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:nvidia}
-    pull_policy: ${PULL_POLICY:-build}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: nvidia
-      args:
-        ACCELERATOR: cuda
-        CUDA_VERSION: ${CUDA_VERSION:-cu128}
+    image: ghcr.io/monster-spawned-studios/comfyui-mss-login:nvidia
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: cuda
-      NVIDIA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
     deploy:
       resources:
@@ -33,15 +20,8 @@ services:
               capabilities: ["gpu"]
 
   rocm:
-    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:rocm}
-    pull_policy: ${PULL_POLICY:-build}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: rocm
-      args:
-        ACCELERATOR: rocm
-        ROCM_VERSION: ${ROCM_VERSION:-rocm6.2.4}
+    image: ghcr.io/monster-spawned-studios/comfyui-mss-login:rocm
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: rocm
     devices:
@@ -52,15 +32,8 @@ services:
       - "render"
 
   cpu:
-    image: ${COMFYUI_IMAGE:-monster-spawned-studios/comfyui-mss-login:cpu}
-    pull_policy: ${PULL_POLICY:-build}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: cpu
-      args:
-        ACCELERATOR: cpu
+    image: ghcr.io/monster-spawned-studios/comfyui-mss-login:cpu
+    pull_policy: ${PULL_POLICY:-missing}
     environment:
       DEVICE_TYPE: cpu
-      USE_CPU: 1
-
+      USE_CPU: "1"

@@ -1,0 +1,22 @@
+# Custom-node folders whose requirements.txt may be installed at startup.
+# One case-sensitive directory name per line. No globs.
+# MSS-Login is installed at image build and must not appear here.
+# ComfyUI-Manager is baked at /opt/comfyui-manager with hashed deps and must not appear here.
+# comfyui_ryanonyheinside and comfyui-supir are omitted: they ship a
+# requirements.txt but have no verifiable git remote.
+comfyui_controlnet_aux
+ComfyUI-Crystools
+ComfyUI-Easy-Use
+ComfyUI_essentials
+ComfyUI-GGUF
+ComfyUI-Impact-Pack
+ComfyUI-Impact-Subpack
+ComfyUI_InstantID
+ComfyUI-KJNodes
+ComfyUI-RMBG
+comfyui_segment_anything
+comfyui-tooling-nodes
+ComfyUI-VideoHelperSuite
+portal-endpoint
+PuLID_ComfyUI
+rgthree-comfy

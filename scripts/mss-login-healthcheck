@@ -1,0 +1,19 @@
+#!/bin/bash
+# Docker healthcheck. Uses the same CLI assembly as the entrypoint so the
+# port is COMFYUI_PORT, or --port from CLI_ARGS/EXTRA_CLI_ARGS, else 9008.
+# PATH is system directories only. curl is absolute so a venv curl cannot run.
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# shellcheck source=entrypoint.sh
+source /usr/local/bin/entrypoint.sh
+build_cli_args
+port="$(mss_listen_port)"
+[[ "$port" =~ ^[0-9]{1,5}$ ]] || exit 1
+body="$(/usr/bin/mktemp)"
+code="$(/usr/bin/curl -s -o "$body" -w '%{http_code}' --max-time 10 "http://127.0.0.1:${port}/login" || true)"
+if mss_login_login_body_ok "$code" "$body"; then
+  rm -f "$body"
+  exit 0
+fi
+rm -f "$body"
+exit 1

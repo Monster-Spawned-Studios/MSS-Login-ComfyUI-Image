@@ -7,7 +7,7 @@
 
 # ----- Background removal (BiRefNet) - graphs 40-44, 53, portal_3d_local_hy3d2mini, portal_3d_anima_to_hy3d2mini -----
 # Lands as models/background_removal/birefnet.safetensors (the type prefix needs the updated 01-download-models.sh)
-background_removal:https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal/birefnet.safetensors
+background_removal:https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal/birefnet.safetensors#sha256=796e4ababf8368833ae155c9063ce8a6bce38bc1b3783682e62c87f789cddcbe
 
 # ----- Hunyuan3D single-file checkpoints (sources for 3D/tools/split_hunyuan3d_ckpt.py) -----
 # tencent Hunyuan3D-2mini fp16 -> lands as checkpoints/model.fp16.safetensors (generic upstream name).
@@ -16,10 +16,10 @@ background_removal:https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/backgr
 # DONE 2026-10-08: both names already hard-link the same inode (deleting either frees 0 bytes and would re-download).
 # If a fresh host only has model.fp16.safetensors, recreate the link:
 #   ln /mnt/tmd-secure/Data/Docker/ComfyUI/models/checkpoints/model.fp16.safetensors /mnt/tmd-secure/Data/Docker/ComfyUI/models/checkpoints/hunyuan3d-dit-v2-mini_fp16.safetensors
-checkpoint:https://huggingface.co/tencent/Hunyuan3D-2mini/resolve/main/hunyuan3d-dit-v2-mini/model.fp16.safetensors
+checkpoint:https://huggingface.co/tencent/Hunyuan3D-2mini/resolve/main/hunyuan3d-dit-v2-mini/model.fp16.safetensors#sha256=e5d04846c8b192f340a77c49516af174ea0bb61dd6fcc3eee39ef65264aee681
 # Comfy-Org repackaged Hunyuan3D 2.0 (full) and 2.1 (2.1 is the source for graph 42's hy3d21_* files)
-checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.0_repackaged/resolve/main/split_files/hunyuan3d-dit-v2_fp16.safetensors
-checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.1_repackaged/resolve/main/hunyuan_3d_v2.1.safetensors
+checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.0_repackaged/resolve/main/split_files/hunyuan3d-dit-v2_fp16.safetensors#sha256=da49fa1820576e5f67586f147d7063e53da191976775b62ef309456736814ab1
+checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.1_repackaged/resolve/main/hunyuan_3d_v2.1.safetensors#sha256=d36de92469fa0991a864cd4995cf694e5fc8d54adf5d54892e9154bdeed8b376
 # The hy3d2mini_* / hy3d21_* DiT, DINO and VAE files the MultiGPU graphs load are NOT downloadable;
 # make them on the host after these finish, e.g.:
 #   uv run --with safetensors --with numpy --python 3.12 split_hunyuan3d_ckpt.py <models>/checkpoints/model.fp16.safetensors --name hy3d2mini --models-dir <models>
@@ -28,15 +28,15 @@ checkpoint:https://huggingface.co/Comfy-Org/hunyuan3D_2.1_repackaged/resolve/mai
 # ----- Krea 2 GGUF Q4_0 - graph 32 and portal_krea2_gguf_lora_stack (GGUF loaders read models/unet/) -----
 # DONE 2026-10-08: file is already in models/unet/krea2_turbo_bf16-Q4_0.gguf (not in checkpoints/).
 # This line is kept so a fresh host still gets it into unet/ on first start; the downloader skips when present.
-unet:https://huggingface.co/molbal/krea2-gguf/resolve/main/krea2_turbo_bf16-Q4_0.gguf
+unet:https://huggingface.co/molbal/krea2-gguf/resolve/main/krea2_turbo_bf16-Q4_0.gguf#sha256=217f13a6bf2f23e366cbbd45d3e68a80ad332bfff3cf9ef00cb1062857aabdf7
 
 # ----- Krea 2 style LoRAs + optional Dasiwa (enabled 2026-10-08 for lora_stack placeholders / graph 33) -----
 # Official Comfy-Org Krea 2 style LoRAs (about 470 MB each). Pick these in the YOUR_KREA2_LORA_* slots
 # in graphs 32/33/portal_krea2 (graphs are not edited; choose in the UI). Not tested with turbo Q4_0 GGUF.
-lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_retroanime.safetensors
-lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_softwatercolor.safetensors
-lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_neondrip.safetensors
-lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_style_reference.safetensors
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_retroanime.safetensors#sha256=c04c7787cb99eaedb0abdbcb4449fec5880a05c470bfe9f2f2bf8ade66975270
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_softwatercolor.safetensors#sha256=45da2776f5d277582f623f8d264bf177bacbdee10dd8b5c135deea14eb81b12b
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_neondrip.safetensors#sha256=4302ae2da244ec36567ffe76c0ccf3f8e7d7fb6459a73a7dc82d97e2a14551ea
+lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_style_reference.safetensors#sha256=4b4297d095338ef1dd1548684168f5a8a02ef9f2db4cc9d09d776043d7079bd7
 # DaSiWa Krea2 DarkDesire V3 Turbo UC, bf16 25.7 GB: the exact file graph 33 names
 # (DasiwaKrea2TurboRaw_darkdesireV3TurboUC_3250905.safetensors = Civitai version 3362930, fileId 3250905).
 # NOT recommended on this laptop (see lora_stack/README.md; ~52 GB RAM peak on load). Enabled so it can download
@@ -69,49 +69,49 @@ lora:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/loras/krea2_style_refe
 # ============================================================
 
 # ----- ACE-Step 1.5 (music) -----
-checkpoint:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/checkpoints/ace_step_1.5_turbo_aio.safetensors
-diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_turbo.safetensors
-diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_turbo_bf16.safetensors
-diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_sft_bf16.safetensors
-diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_base_bf16.safetensors
-text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_0.6b_ace15.safetensors
-text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_1.7b_ace15.safetensors
-text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_4b_ace15.safetensors
-vae:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/vae/ace_1.5_vae.safetensors
+checkpoint:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/checkpoints/ace_step_1.5_turbo_aio.safetensors#sha256=6bb8be0c46446f097901cf48c64d38ccff5b10bcb8d3e15133eef01a3136951d
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_turbo.safetensors#sha256=077d06c5a16c9f9ff327389b66b0dd355fe3b8f7ad2777ef6767cbd9022d2a7c
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_turbo_bf16.safetensors#sha256=d82cd2e21149a13cba5ea40729f092e21dd66580ab516356664d8230883454af
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_sft_bf16.safetensors#sha256=c442c658edacb5d6c11d4ba1f2409c0b8f932ae5943f2675689f0e3198c5a511
+diffusion:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_base_bf16.safetensors#sha256=b0c298137993515b487bbe77ecc489e1e88a1e278d49080e7c63d99a8ae0bd1c
+text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_0.6b_ace15.safetensors#sha256=ee799265a77efd8c262fc390751cdbaa94282b65d5d81e9558100aee52b9e8a5
+text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_1.7b_ace15.safetensors#sha256=57a567a4164864013c4dda7eed7f8446260bb8e19e5e4ca25e5791273c33e4f1
+text_encoders:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_4b_ace15.safetensors#sha256=975663512122ca99fe7237488be4051cb254d63670cbb7a572efcd2d936fbdab
+vae:https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/vae/ace_1.5_vae.safetensors#sha256=c2e22c70d3da60118c4ec067db5ddc53af2f97038b13c7e3a412e5df600a037e
 
 # ----- Anima (image) -----
-diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors
-diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors
-diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-turbo-v1.1.safetensors
-text_encoders:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors
-vae:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors
+diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors#sha256=4382bf9d5d21eb34262f5136ea9c6de49b3209b71a6fc9581e20460934dcddec
+diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors#sha256=11414fd42e1745bf945c977bf0f33316bf8b2704847017b40fd3b122f0bd23d8
+diffusion:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-turbo-v1.1.safetensors#sha256=bb75f495452bfc162fd5b4a51118ce61a12607183670770ffef3fa2ceaa02e19
+text_encoders:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors#sha256=1e48a7f3dfbc9a887e0ec71eef7c3dadd9c5109c6d9b10881f82ade063dbb8c4
+vae:https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors#sha256=b4020d780417b174bc6bb0025b3cc9cce7db9bb51f9fe23718691dfffdb65aea
 # JANIMA Anima v1.0 pruned fp16 (Civitai model version 2967640, fileId 2847103, ~3.90 GB).
 # Lands as checkpoints/JANIMAAnima_v10_2847103.safetensors (API name) for anima/13 + portal_janima_ckpt_t2i.
 # Needs CIVITAI_TOKEN (download redirects to login without it). Verified against Civitai API 2026-10-08.
-checkpoint:https://civitai.com/api/download/models/2967640?fileId=2847103
+checkpoint:https://civitai.com/api/download/models/2967640?fileId=2847103#sha256=38694ed21a93dd425fd3bf5a8c7a9f15070c1ecf6e5ab5e2138989c334ceea26
 
 # ----- Krea 2 (image) -----
-unet:https://huggingface.co/molbal/krea2-gguf/resolve/main/krea2_turbo-Q4_CR.gguf
-text_encoders:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
-diffusion:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors
-diffusion:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors
+unet:https://huggingface.co/molbal/krea2-gguf/resolve/main/krea2_turbo-Q4_CR.gguf#sha256=e8cd0c27acca8cf1bbb981bb12dbb546ad0743a06a315ea2b84547598418590b
+text_encoders:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors#sha256=65b20127a927c9cd95168b46a308d456708ccfbb8960b9ab384fd4a0641101ef
+diffusion:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors#sha256=2e83bf6e023aefb2a0a6dd2fa8c111634815cbe1a8b1a6f1f80e057f7eb54096
+diffusion:https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors#sha256=f76f63f9292202a5ad33a5861cdc569f190927db8e03c313b0bd3667a4a72638
 
 # ----- Qwen Image 2512 (image) -----
 # Hardware: RTX 4060 8GB (Ada/FP8) + RTX 3050 6GB + 32GB RAM → FP8 + MultiGPU/RAM offload
 # Prefer latest 2512 fp8 over bf16; Lightning 8-step bf16 LoRA for speed without bloating VRAM
-diffusion:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors
-text_encoders:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
-vae:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors
-lora:https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning/resolve/main/Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors
+diffusion:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors#sha256=f07f1483dc9b19752b6032576a82c94b6e6cce3e0cad77ae27e928b7072b1c05
+text_encoders:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors#sha256=426f6374f395199f58c7c8b7d2b39198c71148fd4af1ca2a7cf55fba701a6602
+vae:https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors#sha256=af593c8dd215d3a8b62cb0d9b976b0c689941c86e978917dc374ad4b33cd8898
+lora:https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning/resolve/main/Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors#sha256=802bb37f296ee5842e0cb6cd9a3bce46be6f929fd1262639fb659c47bf2c0e52
 
 # ----- Qwen Image Edit 2511 (image edit) -----
 # fp8mixed keeps sensitive layers higher-precision (best Comfy-Org quant at ~20GB)
-diffusion:https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors
-lora:https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
+diffusion:https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors#sha256=caa61d7739ed909e1de7574823b0051cae85ca7aeedce6c37198bba5511d5a0e
+lora:https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors#sha256=9c18be24d0d074e99c44d659fd3c19b9d5f2d65ba654855c90366b5445b2c29b
 
 # ----- LTXV 2B 0.9.8 distilled-fp8 (video; fits 8GB with short clips) -----
-checkpoint:https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled-fp8.safetensors
-clip:https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors
+checkpoint:https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled-fp8.safetensors#sha256=3b3f11823040a30e4a89c343a546247a6050c59e6c9ace73fdb5640e6d6f6d13
+clip:https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors#sha256=31868d1bd1d855ac37b339079a06166ed46c230f9cce4904d7e09408a77a13e8
 
 # ----- Krita AI Diffusion (fits 4060 8GB + 3050 6GB) -----
 # Added 2026-10-08 (t40u). Source of truth: Acly/krita-ai-diffusion v1.53.0 (latest release)
