@@ -1,0 +1,162 @@
+diff --git a/__init__.py b/__init__.py
+index 2b19df3..b7aa876 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -511,6 +511,20 @@ from .utils.force_https import create_security_headers_middleware
+ 
+ app.middlewares.append(create_security_headers_middleware(cloudflare_proxy=CLOUDFLARE_PROXY))
+ 
++# comfyui-mss-login image: ComfyUI-Manager routes are owner-only and read-only.
++# Registered before the remote API guard and JWT middleware so local-network
++# and unauthenticated requests get 403, not a pass or a redirect.
++from .utils.manager_owner_gate import create_manager_owner_gate_middleware
++
++
++def _manager_gate_is_owner(request):
++	from .routes.admin import is_owner
++
++	return is_owner(request)
++
++
++app.middlewares.append(create_manager_owner_gate_middleware(_manager_gate_is_owner))
++
+ if FORCE_HTTPS:
+ 	from .utils.force_https import create_https_middleware
+ 
+diff --git a/utils/manager_owner_gate.py b/utils/manager_owner_gate.py
+new file mode 100644
+index 0000000..b6bb8df
+--- /dev/null
++++ b/utils/manager_owner_gate.py
+@@ -0,0 +1,131 @@
++# --- START OF FILE utils/manager_owner_gate.py ---
++"""ComfyUI-Manager owner gate (comfyui-mss-login image patch).
++
++Added by patches/mss-login-manager-owner-gate.patch. Not part of upstream
++MSS-Login. Every request whose path is a ComfyUI-Manager path, after
++percent-decoding (repeated), lower-casing, collapsing slashes, resolving dot
++segments, dropping trailing slashes, and stripping any number of leading /api
++prefixes, answers 403 unless:
++
++- MSS-Login's own owner check (routes.admin.is_owner: "owner" in the caller's
++  groups, resolved from the request token) returns exactly True, and
++- the method and route are on OWNER_READ_ROUTES.
++
++Any exception while deciding is a 403. When the owner is allowed, the request
++is marked with request["mss_login_manager_owner"] = True. The patched
++ComfyUI-Manager refuses every one of its routes when that mark is missing, so
++Manager stays closed if this middleware is not registered.
++"""
++
++import posixpath
++import re
++from urllib.parse import unquote
++
++from aiohttp import web
++
++OWNER_FLAG = "mss_login_manager_owner"
++
++MANAGER_SEGMENTS = frozenset({"manager", "customnode", "externalmodel", "snapshot", "comfyui_manager"})
++MANAGER_EXTENSION_PREFIX = "comfyui-manager"
++
++# Keep in step with comfyui_manager/mss_lockdown.py OWNER_READ_ROUTES.
++OWNER_READ_ROUTES = frozenset(
++	{
++		("GET", "/v2/comfyui_manager/comfyui_versions"),
++		("GET", "/v2/customnode/getmappings"),
++		("GET", "/v2/customnode/installed"),
++		("GET", "/v2/manager/channel_url_list"),
++		("GET", "/v2/manager/db_mode"),
++		("GET", "/v2/manager/is_legacy_manager_ui"),
++		("GET", "/v2/manager/policy/update"),
++		("GET", "/v2/manager/queue/history"),
++		("GET", "/v2/manager/queue/history_list"),
++		("GET", "/v2/manager/queue/status"),
++		("GET", "/v2/manager/version"),
++		("GET", "/v2/snapshot/get_current"),
++		("GET", "/v2/snapshot/getlist"),
++		("POST", "/v2/customnode/import_fail_info"),
++		("POST", "/v2/customnode/import_fail_info_bulk"),
++		("POST", "/v2/manager/queue/reset"),
++	}
++)
++
++
++def canonical_paths(*paths):
++	"""Lower-cased, percent-decoded, dot-normalized paths with /api stripped."""
++	out = set()
++	for value in paths:
++		if value is None:
++			continue
++		p = str(value).split("?", 1)[0].split("#", 1)[0]
++		for _ in range(4):
++			decoded = unquote(p)
++			if decoded == p:
++				break
++			p = decoded
++		p = p.replace("\\", "/").replace("\x00", "").lower()
++		p = re.sub(r"/+", "/", "/" + p)
++		p = posixpath.normpath(p)
++		if not p.startswith("/"):
++			p = "/" + p
++		while p == "/api" or p.startswith("/api/"):
++			p = p[4:] or "/"
++		out.add(p)
++	return out
++
++
++def is_manager_path(path):
++	segs = [s for s in path.split("/") if s]
++	if not segs:
++		return False
++	if segs[0] == "v2" and len(segs) > 1 and segs[1] in MANAGER_SEGMENTS:
++		return True
++	if segs[0] in MANAGER_SEGMENTS:
++		return True
++	if segs[0] == "extensions" and len(segs) > 1 and segs[1].startswith(MANAGER_EXTENSION_PREFIX):
++		return True
++	return False
++
++
++def owner_route_allowed(method, path):
++	method = (method or "").upper()
++	if method == "HEAD":
++		method = "GET"
++	return (method, path) in OWNER_READ_ROUTES
++
++
++def _deny(text):
++	return web.Response(status=403, text=text)
++
++
++def create_manager_owner_gate_middleware(is_owner_fn):
++	"""Return the middleware. is_owner_fn(request) must return True for the owner."""
++
++	@web.middleware
++	async def manager_owner_gate(request, handler):
++		try:
++			raw = request.raw_path
++		except Exception:
++			raw = None
++		try:
++			candidates = canonical_paths(request.path, raw)
++		except Exception:
++			return _deny("ComfyUI-Manager is available to the MSS-Login owner only.")
++		managed = [p for p in candidates if is_manager_path(p)]
++		if not managed:
++			return await handler(request)
++		try:
++			owner = is_owner_fn(request) is True
++		except Exception:
++			owner = False
++		if not owner:
++			return _deny("ComfyUI-Manager is available to the MSS-Login owner only.")
++		if not all(owner_route_allowed(request.method, p) for p in managed):
++			return _deny("This ComfyUI-Manager action is disabled in this image. Change nodes by rebuilding the image.")
++		request[OWNER_FLAG] = True
++		return await handler(request)
++
++	return manager_owner_gate
++
++
++# --- END OF FILE utils/manager_owner_gate.py ---

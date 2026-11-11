@@ -899,6 +899,10 @@ prepare_as_root() {
   # 1000. prepare_mss_login then copies the pin and locks that tree root:root
   # before setpriv. The mounted .bashrc is not sourced.
   prepare_mss_login
+  reject_legacy_manager_nodes
+  if comfyui_manager_enabled; then
+    verify_comfyui_manager_tree
+  fi
 }
 
 # MSS-Login 1d9acbc reads auto_update from DATA_DIR/config.json, not from an
@@ -1024,7 +1028,8 @@ cli_denied_flag_names() {
     --user-directory \
     --models-directory \
     --front-end-root \
-    --comfy-api-base
+    --comfy-api-base \
+    --disable-manager-ui
 }
 
 cli_node_path_flag_denied() {
@@ -1241,7 +1246,7 @@ refuse_cli_node_path_flags() {
   set +f
   for arg in "${args[@]}"; do
     if cli_node_path_flag_denied "$arg"; then
-      refuse_mss_login "Refusing CLI flag ${arg%%=*}. It changes custom-node loading or a base path. Refused flags: --disable-all-custom-nodes, --whitelist-custom-nodes, --enable-manager, --enable-manager-legacy-ui, --disabled-nodes-config, --disable-partner-nodes, --disable-api-nodes, --offline, --base-directory, --extra-model-paths-config, --output-directory, --temp-directory, --input-directory, --previews-directory, --user-directory, --models-directory."
+      refuse_mss_login "Refusing CLI flag ${arg%%=*}. It changes custom-node loading or a base path. Refused flags: --disable-all-custom-nodes, --whitelist-custom-nodes, --enable-manager, --enable-manager-legacy-ui, --disabled-nodes-config, --disable-partner-nodes, --disable-api-nodes, --offline, --base-directory, --extra-model-paths-config, --output-directory, --temp-directory, --input-directory, --previews-directory, --user-directory, --models-directory, --front-end-root, --comfy-api-base, --disable-manager-ui. The image adds --enable-manager itself when COMFYUI_MANAGER_ENABLED is true."
     fi
   done
 }
@@ -1301,6 +1306,197 @@ PY
   fi
 }
 
+# ComfyUI-Manager is baked at /opt/comfyui-manager/site (root-owned, pinned,
+# patched by comfyui-manager-mss-lockdown.patch). It is enabled by default and
+# reachable only by the MSS-Login owner, read-only. The user may not pass
+# --enable-manager, --enable-manager-legacy-ui or --disable-manager-ui; the
+# entrypoint adds --enable-manager itself after the CLI checks.
+comfyui_manager_enabled() {
+  is_truthy "${COMFYUI_MANAGER_ENABLED:-true}"
+}
+
+comfyui_manager_root() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_MANAGER_ROOT:-}" ]]; then
+    printf '%s\n' "$MSS_MANAGER_ROOT"
+  else
+    printf '%s\n' "/opt/comfyui-manager"
+  fi
+}
+
+comfyui_manager_user_dir() {
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" == "1" && -n "${MSS_MANAGER_USER_DIR:-}" ]]; then
+    printf '%s\n' "$MSS_MANAGER_USER_DIR"
+  else
+    printf '%s\n' "/app/ComfyUI/user/__manager"
+  fi
+}
+
+refuse_comfyui_manager() {
+  echo "[comfyui-deploy] Refusing to start. $*" >&2
+  echo "[comfyui-deploy] Set COMFYUI_MANAGER_ENABLED=false to start without ComfyUI-Manager." >&2
+  exit 1
+}
+
+# Root-owned tree, lockdown patch recorded, manifest match, and (as root)
+# uid 1000 cannot write it. Any failure refuses to start.
+verify_comfyui_manager_tree() {
+  local root site manifest stray
+  root="$(comfyui_manager_root)"
+  site="${root}/site"
+  manifest="${root}/MANIFEST"
+  if [[ ! -d "$site" || -L "$site" || -L "$root" ]]; then
+    refuse_comfyui_manager "ComfyUI-Manager is enabled but ${site} is missing or a symlink."
+  fi
+  if [[ ! -f "$manifest" || ! -f "${manifest}.entries" || ! -f "${manifest}.dirs" ]]; then
+    refuse_comfyui_manager "ComfyUI-Manager manifest is missing at ${manifest}."
+  fi
+  if [[ ! -f "${root}/PATCHES" ]] || ! grep -qx 'comfyui-manager-mss-lockdown.patch' "${root}/PATCHES"; then
+    refuse_comfyui_manager "ComfyUI-Manager at ${root} does not record comfyui-manager-mss-lockdown.patch."
+  fi
+  if [[ ! -f "${site}/comfyui_manager/mss_lockdown.py" || -L "${site}/comfyui_manager/mss_lockdown.py" ]]; then
+    refuse_comfyui_manager "ComfyUI-Manager at ${site} has no mss_lockdown.py."
+  fi
+  if ! verify_manifest "$site" "$manifest"; then
+    refuse_comfyui_manager "ComfyUI-Manager at ${site} does not match ${manifest}."
+  fi
+  if [[ "${MSS_LOGIN_TEST_MODE:-}" != "1" ]]; then
+    stray="$(find "$root" ! -uid 0 -print -quit 2>/dev/null || true)"
+    if [[ -n "$stray" ]]; then
+      refuse_comfyui_manager "ComfyUI-Manager path ${stray} is not owned by root."
+    fi
+    if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then
+      if ! assert_uid1000_cannot_write "$site"; then
+        refuse_comfyui_manager "uid ${COMFY_UID} could modify ComfyUI-Manager at ${site}."
+      fi
+    else
+      stray="$(find "$root" -writable -print -quit 2>/dev/null || true)"
+      if [[ -n "$stray" ]]; then
+        refuse_comfyui_manager "ComfyUI-Manager path ${stray} is writable by uid $(id -u)."
+      fi
+    fi
+  fi
+  echo "[comfyui-deploy] ComfyUI-Manager $(tr -d '[:space:]' < "${root}/VERSION" 2>/dev/null || echo unknown) at ${site} matches its manifest."
+}
+
+# A custom_nodes entry whose name contains comfyui-manager is the legacy
+# custom-node Manager. ComfyUI's comfyui_manager.should_be_disabled skips it
+# when --enable-manager is set. Without --enable-manager it would load with
+# no owner gate, so startup refuses.
+reject_legacy_manager_nodes() {
+  local nodes_root path name
+  nodes_root="${NODES_DIR:-/app/ComfyUI/custom_nodes}"
+  [[ -d "$nodes_root" ]] || return 0
+  shopt -s nullglob dotglob
+  for path in "${nodes_root}"/*; do
+    name="$(basename "$path")"
+    [[ "${name,,}" == *comfyui-manager* ]] || continue
+    loader_would_import "$path" || continue
+    if comfyui_manager_enabled; then
+      echo "[comfyui-deploy] ${path} is a legacy ComfyUI-Manager. ComfyUI skips it while the baked Manager is enabled." >&2
+    else
+      shopt -u nullglob dotglob
+      refuse_comfyui_manager "${path} is a legacy ComfyUI-Manager and would load with no owner gate. Remove it, rename it to *.disabled, or enable the baked Manager."
+    fi
+  done
+  shopt -u nullglob dotglob
+}
+
+# Written as uid 1000 at every start. The whole config.ini is replaced, so a
+# value changed in the user volume does not survive a restart. The patched
+# Manager also forces these keys in read_config(). install-scripts.txt and
+# restore-snapshot.json are renamed *.refused-<epoch>; the patched Manager
+# never reads them.
+force_comfyui_manager_config() {
+  local dir status
+  dir="$(comfyui_manager_user_dir)"
+  set +e
+  comfy_python -S - "$dir" <<'PY'
+import os
+import sys
+import time
+
+d = sys.argv[1]
+if os.path.islink(d):
+    sys.stderr.write(f"[comfyui-deploy] {d} is a symlink.\n")
+    sys.exit(2)
+os.makedirs(d, exist_ok=True)
+if not os.path.isdir(d) or os.path.islink(d):
+    sys.stderr.write(f"[comfyui-deploy] {d} is not a directory.\n")
+    sys.exit(2)
+forced = [
+    ("security_level", "strong"),
+    ("network_mode", "offline"),
+    ("db_mode", "local"),
+    ("use_uv", "false"),
+    ("use_unified_resolver", "false"),
+    ("bypass_ssl", "false"),
+    ("file_logging", "false"),
+    ("http_channel_enabled", "false"),
+    ("channel_url", "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main"),
+    ("default_cache_as_channel_url", "false"),
+    ("allow_git_url_install", "false"),
+    ("allow_pip_install", "false"),
+    ("allow_flagged_nodepack_install", "false"),
+    ("always_lazy_install", "false"),
+    ("model_download_by_agent", "false"),
+    ("update_policy", "stable-comfyui"),
+    ("git_exe", ""),
+    ("share_option", "none"),
+    ("downgrade_blacklist", ""),
+    ("windows_selector_event_loop_policy", "false"),
+    ("verbose", "false"),
+]
+content = "# Written by the comfyui-mss-login entrypoint at every start. Edits are discarded.\n[default]\n"
+content += "".join(f"{k} = {v}\n" for k, v in forced)
+path = os.path.join(d, "config.ini")
+old = None
+if os.path.islink(path) or (os.path.lexists(path) and not os.path.isfile(path)):
+    old = "<not a regular file>"
+elif os.path.isfile(path):
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        old = handle.read()
+if old is not None and old != content:
+    sys.stderr.write(f"[comfyui-deploy] WARNING: {path} differed from the forced ComfyUI-Manager config. It was replaced.\n")
+if os.path.isdir(path) and not os.path.islink(path):
+    sys.stderr.write(f"[comfyui-deploy] {path} is a directory.\n")
+    sys.exit(2)
+tmp = path + ".mss-tmp"
+if os.path.lexists(tmp):
+    os.unlink(tmp)
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    handle.write(content)
+os.replace(tmp, path)
+stamp = int(time.time())
+scripts = os.path.join(d, "startup-scripts")
+if os.path.isdir(scripts) and not os.path.islink(scripts):
+    for name in ("install-scripts.txt", "restore-snapshot.json"):
+        target = os.path.join(scripts, name)
+        if os.path.lexists(target):
+            os.replace(target, f"{target}.refused-{stamp}")
+            sys.stderr.write(f"[comfyui-deploy] WARNING: renamed pending Manager {name} to {name}.refused-{stamp}. It is never run.\n")
+PY
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    refuse_comfyui_manager "Could not force the ComfyUI-Manager config in ${dir}."
+  fi
+  echo "[comfyui-deploy] ComfyUI-Manager config in ${dir}/config.ini is forced: security_level=strong, network_mode=offline, no pip, no git-url, no file logging."
+}
+
+# PYTHONPATH is the root-owned site directory only. The import must resolve
+# there, not to a comfyui_manager planted in the uid 1000 venv.
+prepare_comfyui_manager_import() {
+  local site want got
+  site="$(comfyui_manager_root)/site"
+  export PYTHONPATH="$site"
+  want="${site}/comfyui_manager/__init__.py"
+  got="$(comfy_python -c 'import importlib.util; s = importlib.util.find_spec("comfyui_manager"); print(s.origin if s else "")' 2>/dev/null || true)"
+  if [[ "$got" != "$want" ]]; then
+    refuse_comfyui_manager "comfyui_manager resolves to '${got:-nothing}', expected ${want}."
+  fi
+}
+
 # GET /login must be HTTP 200 and include the MSS-Login page marker.
 # Redirects are not enough: another service could answer 302.
 mss_login_login_body_ok() {
@@ -1343,6 +1539,11 @@ launch_comfyui() {
   warn_if_insightface_models_missing
   force_mss_login_auto_update_notify
   prepare_mss_login
+  reject_legacy_manager_nodes
+  if comfyui_manager_enabled; then
+    verify_comfyui_manager_tree
+    force_comfyui_manager_config
+  fi
 
   detect_line="$(
     comfy_python - <<'PY'
@@ -1430,11 +1631,16 @@ PY
   refuse_extra_model_paths_custom_nodes
 
   cd /app/ComfyUI
-  echo "[comfyui-deploy] Launching ComfyUI with args: ${CLI_ARGS} $*"
   local -a comfy_argv=()
   set -f
   read -r -a comfy_argv <<< "$CLI_ARGS"
   set +f
+  if comfyui_manager_enabled; then
+    prepare_comfyui_manager_import
+    comfy_argv+=(--enable-manager)
+    echo "[comfyui-deploy] ComfyUI-Manager is enabled for the MSS-Login owner only (read-only)."
+  fi
+  echo "[comfyui-deploy] Launching ComfyUI with args: ${comfy_argv[*]} $*"
   comfy_python main.py "${comfy_argv[@]}" "$@" &
   local child=$!
   trap 'kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true' TERM INT

@@ -1,0 +1,317 @@
+diff --git a/comfyui_manager/__init__.py b/comfyui_manager/__init__.py
+index 4faa8c81..1f4cea5b 100644
+--- a/comfyui_manager/__init__.py
++++ b/comfyui_manager/__init__.py
+@@ -27,8 +27,11 @@ except ImportError:
+ 
+ 
+ def prestartup():
+-    from . import prestartup_script  # noqa: F401
+-    logging.info('[PRE] ComfyUI-Manager')
++    # mss-lockdown: prestartup_script.py runs pip, git, uv, downloads,
++    # install-scripts.txt and restore-snapshot.json. It is not imported.
++    from .mss_lockdown import mss_prestartup
++    mss_prestartup()
++    logging.info('[PRE] ComfyUI-Manager (mss-lockdown)')
+ 
+ 
+ def start():
+@@ -37,6 +40,8 @@ def start():
+ 
+     if args.enable_manager:
+         if args.enable_manager_legacy_ui:
++            # mss-lockdown: the legacy UI is refused in this image.
++            raise RuntimeError('[ComfyUI-Manager] The legacy UI is disabled in this image (mss-lockdown).')
+             try:
+                 from .legacy import manager_server  # noqa: F401
+                 from .legacy import share_3rdparty  # noqa: F401
+@@ -64,6 +69,12 @@ def start():
+         if core is not None:
+             manager_security.is_personal_cloud_mode = core.get_config()['network_mode'].lower() == 'personal_cloud'
+ 
++        # mss-lockdown: every Manager route answers 403 unless the MSS-Login
++        # owner gate marked the request, and only read routes are allowed.
++        from server import PromptServer
++        from .mss_lockdown import lock_manager_routes
++        lock_manager_routes(PromptServer.instance.routes)
++
+ 
+ def should_be_disabled(fullpath:str) -> bool:
+     """
+diff --git a/comfyui_manager/glob/manager_core.py b/comfyui_manager/glob/manager_core.py
+index 63096334..0cb4354b 100644
+--- a/comfyui_manager/glob/manager_core.py
++++ b/comfyui_manager/glob/manager_core.py
+@@ -1743,6 +1743,12 @@ def write_config():
+ 
+ 
+ def read_config():
++    """mss-lockdown: security keys come from FORCED_CONFIG, not config.ini."""
++    from ..mss_lockdown import apply_forced_config
++    return apply_forced_config(_upstream_read_config())
++
++
++def _upstream_read_config():
+     try:
+         config = configparser.ConfigParser(strict=False)
+         config.read(context.manager_config_path)
+diff --git a/comfyui_manager/legacy/manager_core.py b/comfyui_manager/legacy/manager_core.py
+index 05ffdc7e..d9addc23 100644
+--- a/comfyui_manager/legacy/manager_core.py
++++ b/comfyui_manager/legacy/manager_core.py
+@@ -1757,6 +1757,12 @@ def write_config():
+ 
+ 
+ def read_config():
++    """mss-lockdown: security keys come from FORCED_CONFIG, not config.ini."""
++    from ..mss_lockdown import apply_forced_config
++    return apply_forced_config(_upstream_read_config())
++
++
++def _upstream_read_config():
+     try:
+         config = configparser.ConfigParser(strict=False)
+         config.read(context.manager_config_path)
+diff --git a/comfyui_manager/mss_lockdown.py b/comfyui_manager/mss_lockdown.py
+new file mode 100644
+index 00000000..20a4eeff
+--- /dev/null
++++ b/comfyui_manager/mss_lockdown.py
+@@ -0,0 +1,226 @@
++"""MSS-Login image lockdown for ComfyUI-Manager.
++
++This file is added by patches/comfyui-manager-mss-lockdown.patch in the
++comfyui-mss-login image. It is not part of upstream ComfyUI-Manager.
++
++Three controls live here:
++
++1. FORCED_CONFIG replaces whatever config.ini says for every security setting.
++   The image re-writes config.ini at each start as well, but read_config() in
++   glob/manager_core.py and legacy/manager_core.py passes its result through
++   apply_forced_config(), so a config.ini edited while the container runs is
++   ignored for these keys.
++2. mss_prestartup() replaces prestartup_script.py. It runs no pip, git, uv,
++   cm_cli, downloads, install-scripts.txt, or restore-snapshot.json.
++3. lock_manager_routes() wraps every Manager route handler. A wrapped handler
++   answers 403 unless the MSS-Login owner gate marked the request
++   (request["mss_login_manager_owner"] is True) and the route is on
++   OWNER_READ_ROUTES. Install, update, fix, uninstall, git-url, pip, snapshot
++   restore, ComfyUI switch/update, reboot, settings writes, and share routes
++   are not on that list, so they answer 403 for the owner too. If MSS-Login
++   does not load, nothing sets the flag and every Manager route answers 403.
++"""
++
++from __future__ import annotations
++
++import inspect
++import logging
++import posixpath
++import re
++from urllib.parse import unquote
++
++OWNER_FLAG = "mss_login_manager_owner"
++LOCK_MARK = "__mss_manager_locked__"
++
++# First path segment (after an optional /api and an optional /v2) of every
++# Manager route in glob/ and legacy/ at 4.3 (f764cc0e).
++MANAGER_SEGMENTS = frozenset({"manager", "customnode", "externalmodel", "snapshot", "comfyui_manager"})
++MANAGER_EXTENSION_PREFIX = "comfyui-manager"
++
++# Read-only routes the owner may call. Everything else under the Manager
++# prefixes is refused for every caller, including the owner.
++OWNER_READ_ROUTES = frozenset(
++    {
++        ("GET", "/v2/comfyui_manager/comfyui_versions"),
++        ("GET", "/v2/customnode/getmappings"),
++        ("GET", "/v2/customnode/installed"),
++        ("GET", "/v2/manager/channel_url_list"),
++        ("GET", "/v2/manager/db_mode"),
++        ("GET", "/v2/manager/is_legacy_manager_ui"),
++        ("GET", "/v2/manager/policy/update"),
++        ("GET", "/v2/manager/queue/history"),
++        ("GET", "/v2/manager/queue/history_list"),
++        ("GET", "/v2/manager/queue/status"),
++        ("GET", "/v2/manager/version"),
++        ("GET", "/v2/snapshot/get_current"),
++        ("GET", "/v2/snapshot/getlist"),
++        ("POST", "/v2/customnode/import_fail_info"),
++        ("POST", "/v2/customnode/import_fail_info_bulk"),
++        ("POST", "/v2/manager/queue/reset"),
++    }
++)
++
++DEFAULT_CHANNEL = "https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main"
++
++FORCED_CONFIG = {
++    "security_level": "strong",
++    "network_mode": "offline",
++    "db_mode": "local",
++    "use_uv": False,
++    "use_unified_resolver": False,
++    "bypass_ssl": False,
++    "file_logging": False,
++    "http_channel_enabled": False,
++    "channel_url": DEFAULT_CHANNEL,
++    "default_cache_as_channel_url": False,
++    "allow_git_url_install": False,
++    "allow_pip_install": False,
++    "allow_flagged_nodepack_install": False,
++    "always_lazy_install": False,
++    "model_download_by_agent": False,
++    "update_policy": "stable-comfyui",
++    "git_exe": "",
++    "share_option": "none",
++    "downgrade_blacklist": "",
++    "windows_selector_event_loop_policy": False,
++    "verbose": False,
++}
++
++
++def apply_forced_config(config: dict | None) -> dict:
++    """Return config with every FORCED_CONFIG key overwritten."""
++    out = dict(config) if isinstance(config, dict) else {}
++    out.update(FORCED_CONFIG)
++    try:
++        from .common import manager_util
++
++        manager_util.use_uv = False
++        manager_util.use_unified_resolver = False
++        manager_util.bypass_ssl = False
++    except Exception:  # pragma: no cover - only when imported standalone in tests
++        pass
++    return out
++
++
++def mss_prestartup() -> None:
++    """Stand-in for prestartup_script.py. Sets the globals other modules read."""
++    from .common import cm_global
++
++    cm_global.pip_blacklist = {"torch", "torchaudio", "torchsde", "torchvision"}
++    cm_global.pip_downgrade_blacklist = [
++        "torch",
++        "torchaudio",
++        "torchsde",
++        "torchvision",
++        "transformers",
++        "safetensors",
++        "kornia",
++    ]
++    cm_global.pip_overrides = {}
++    cm_global.variables.setdefault("cm.on_revision_detected_handler", [])
++    cm_global.register_api("cm.register_message_collapse", lambda f: None)
++    cm_global.register_api("cm.is_import_failed_extension", lambda name: False)
++    logging.info(
++        "[ComfyUI-Manager] prestartup_script.py is disabled in this image. "
++        "No pip, git, uv, downloads, install-scripts, or snapshot restore run at startup."
++    )
++
++
++def canonical_paths(*paths: str | None) -> set[str]:
++    """Lower-cased, percent-decoded, dot-normalized paths with /api stripped."""
++    out: set[str] = set()
++    for value in paths:
++        if value is None:
++            continue
++        p = str(value).split("?", 1)[0].split("#", 1)[0]
++        for _ in range(4):
++            decoded = unquote(p)
++            if decoded == p:
++                break
++            p = decoded
++        p = p.replace("\\", "/").replace("\x00", "").lower()
++        p = re.sub(r"/+", "/", "/" + p)
++        p = posixpath.normpath(p)
++        if not p.startswith("/"):
++            p = "/" + p
++        while p == "/api" or p.startswith("/api/"):
++            p = p[4:] or "/"
++        out.add(p)
++    return out
++
++
++def is_manager_path(path: str) -> bool:
++    segs = [s for s in path.split("/") if s]
++    if not segs:
++        return False
++    if segs[0] == "v2" and len(segs) > 1 and segs[1] in MANAGER_SEGMENTS:
++        return True
++    if segs[0] in MANAGER_SEGMENTS:
++        return True
++    if segs[0] == "extensions" and len(segs) > 1 and segs[1].startswith(MANAGER_EXTENSION_PREFIX):
++        return True
++    return False
++
++
++def owner_route_allowed(method: str, template: str) -> bool:
++    method = (method or "").upper()
++    if method == "HEAD":
++        method = "GET"
++    return (method, template) in OWNER_READ_ROUTES
++
++
++def _wrap(method: str, template: str, handler):
++    allowed = owner_route_allowed(method, template)
++
++    async def mss_locked_handler(request):
++        if request.get(OWNER_FLAG) is not True:
++            from aiohttp import web
++
++            return web.Response(status=403, text="ComfyUI-Manager is available to the MSS-Login owner only.")
++        if not allowed or not owner_route_allowed(request.method, template):
++            from aiohttp import web
++
++            return web.Response(
++                status=403,
++                text="This ComfyUI-Manager action is disabled in this image. Change nodes by rebuilding the image.",
++            )
++        result = handler(request)
++        if inspect.isawaitable(result):
++            result = await result
++        return result
++
++    setattr(mss_locked_handler, LOCK_MARK, True)
++    mss_locked_handler.__name__ = getattr(handler, "__name__", "mss_locked_handler")
++    return mss_locked_handler
++
++
++def lock_manager_routes(route_table) -> int:
++    """Wrap every Manager RouteDef in route_table. Returns the number wrapped.
++
++    Raises RuntimeError if a Manager route is left unwrapped, so ComfyUI does
++    not start with an open Manager route.
++    """
++    from aiohttp import web
++
++    items = getattr(route_table, "_items", None)
++    if not isinstance(items, list):
++        raise RuntimeError("ComfyUI-Manager lockdown: route table layout not recognised; refusing to start Manager.")
++    count = 0
++    for index, route in enumerate(list(items)):
++        if not isinstance(route, web.RouteDef):
++            path = getattr(route, "prefix", None) or getattr(route, "path", "")
++            if any(is_manager_path(p) for p in canonical_paths(path)):
++                raise RuntimeError(f"ComfyUI-Manager lockdown: non-handler route at {path}; refusing to start Manager.")
++            continue
++        if not any(is_manager_path(p) for p in canonical_paths(route.path)):
++            continue
++        if getattr(route.handler, LOCK_MARK, False):
++            continue
++        items[index] = web.RouteDef(route.method, route.path, _wrap(route.method, route.path, route.handler), route.kwargs)
++        count += 1
++    for route in items:
++        if isinstance(route, web.RouteDef) and any(is_manager_path(p) for p in canonical_paths(route.path)):
++            if not getattr(route.handler, LOCK_MARK, False):
++                raise RuntimeError(f"ComfyUI-Manager lockdown: {route.method} {route.path} is not locked.")
++    logging.info(f"[ComfyUI-Manager] {count} routes locked to the MSS-Login owner (read-only).")
++    return count
+diff --git a/comfyui_manager/prestartup_script.py b/comfyui_manager/prestartup_script.py
+index d63b12ab..85349e4f 100644
+--- a/comfyui_manager/prestartup_script.py
++++ b/comfyui_manager/prestartup_script.py
+@@ -1,3 +1,6 @@
++# mss-lockdown: this script runs pip, git, uv, cm_cli restore-snapshot,
++# install-scripts.txt and downloads at startup. The image never imports it.
++raise ImportError("ComfyUI-Manager prestartup_script.py is disabled in this image (mss-lockdown).")
+ import os
+ import shutil
+ import subprocess
