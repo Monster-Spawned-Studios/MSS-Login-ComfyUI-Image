@@ -151,21 +151,35 @@ dir_has_entries() {
 ensure_owned() {
   local path="$1"
   local kind="${2:-dir}"
-  local owner
+  local owner sub target_owner
 
   if [[ "$kind" == "file" ]]; then
     [[ -e "$path" ]] || return 0
   else
-    mkdir -p "$path"
+    if [[ ! -L "$path" ]]; then
+      mkdir -p "$path"
+    fi
   fi
 
-  owner="$(stat -c '%u' "$path")"
-  if [[ "$owner" == "$COMFY_UID" ]]; then
-    return 0
+  owner="$(stat -L -c '%u' "$path" 2>/dev/null || stat -c '%u' "$path" 2>/dev/null || echo "$COMFY_UID")"
+  if [[ "$owner" != "$COMFY_UID" ]]; then
+    echo "[comfyui-deploy] Changing ownership of ${path} from uid ${owner} to ${COMFY_UID}."
+    chown -R -H "${COMFY_UID}:${COMFY_GID}" "$path" 2>/dev/null || chown -R "${COMFY_UID}:${COMFY_GID}" "$path" 2>/dev/null || true
   fi
 
-  echo "[comfyui-deploy] Changing ownership of ${path} from uid ${owner} to ${COMFY_UID}."
-  chown -R "${COMFY_UID}:${COMFY_GID}" "$path"
+  if [[ -d "$path" ]]; then
+    shopt -s nullglob
+    for sub in "${path}"/*; do
+      if [[ -L "$sub" && -d "$sub" ]]; then
+        target_owner="$(stat -L -c '%u' "$sub" 2>/dev/null || echo "$COMFY_UID")"
+        if [[ "$target_owner" != "$COMFY_UID" ]]; then
+          echo "[comfyui-deploy] Changing ownership of symlinked subfolder ${sub} from uid ${target_owner} to ${COMFY_UID}."
+          chown -R -H "${COMFY_UID}:${COMFY_GID}" "$sub" 2>/dev/null || chown -R "${COMFY_UID}:${COMFY_GID}" "$sub" 2>/dev/null || true
+        fi
+      fi
+    done
+    shopt -u nullglob
+  fi
 }
 
 # Package name or the plugin entry module, read only from this directory root.
@@ -824,8 +838,8 @@ install_custom_node_deps() {
     node="$(dirname "$req")"
     name="$(basename "$node")"
     [[ "$name" == .* ]] && continue
-    if [[ -L "$node" ]]; then
-      echo "[comfyui-deploy] Skipping custom node ${name}: path is a symlink." >&2
+    if [[ ! -d "$node" ]]; then
+      echo "[comfyui-deploy] Skipping custom node ${name}: not a directory or broken symlink." >&2
       continue
     fi
     if is_mss_login_tree "$node" || { [[ -n "${MSS_LOGIN_RUNTIME_DIR:-}" ]] && [[ "$(realpath "$node")" == "$(realpath "$MSS_LOGIN_RUNTIME_DIR")" ]]; }; then
@@ -1547,14 +1561,24 @@ launch_comfyui() {
 
   detect_line="$(
     comfy_python - <<'PY'
+import importlib.util
 import os
 import sys
 
-mss = os.environ["MSS_DIR"]
-sys.path.insert(0, mss)
-from utils.install_deps import detect_torch_install_plan
+mss = os.environ.get("MSS_DIR", "")
+script_path = os.path.join(mss, "utils", "install_deps.py")
+if not os.path.isfile(script_path):
+    print("cpu pypi requirements.txt")
+    sys.exit(0)
 
-plan = detect_torch_install_plan()
+spec = importlib.util.spec_from_file_location("mss_install_deps", script_path)
+if not spec or not spec.loader:
+    print("cpu pypi requirements.txt")
+    sys.exit(0)
+
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+plan = mod.detect_torch_install_plan() if hasattr(mod, "detect_torch_install_plan") else {}
 backend = plan.get("backend") or "cpu"
 index_url = plan.get("extra_index_url") or "pypi"
 req_file = plan.get("requirements_file") or "requirements.txt"

@@ -32,13 +32,24 @@ comfy --skip-prompt --no-enable-telemetry --workspace /app/ComfyUI update comfy
 
 detect_line="$(
   comfy_python - <<'PY'
+import importlib.util
 import os
 import sys
 
-sys.path.insert(0, os.environ["MSS_DIR"])
-from utils.install_deps import detect_torch_install_plan
+mss = os.environ.get("MSS_DIR", "")
+script_path = os.path.join(mss, "utils", "install_deps.py")
+if not os.path.isfile(script_path):
+    print("cpu pypi requirements.txt")
+    sys.exit(0)
 
-plan = detect_torch_install_plan()
+spec = importlib.util.spec_from_file_location("mss_install_deps", script_path)
+if not spec or not spec.loader:
+    print("cpu pypi requirements.txt")
+    sys.exit(0)
+
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+plan = mod.detect_torch_install_plan() if hasattr(mod, "detect_torch_install_plan") else {}
 print(
     f"{plan.get('backend') or 'cpu'} {plan.get('extra_index_url') or 'pypi'} {plan.get('requirements_file') or 'requirements.txt'}"
 )

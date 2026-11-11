@@ -807,13 +807,13 @@ model_downloader_case() {
   out="$(
     MODELS_DIR="${base}/models" MODELS_DOWNLOAD_DIR="${base}/outside" \
       MSS_MODELS_LIST="${base}/none.txt" \
-      MODELS_TO_DOWNLOAD="checkpoint:http://127.0.0.1:9/..,checkpoint:http://127.0.0.1:9/.hidden,lora:http://127.0.0.1:9/x.safetensors" \
+      MODELS_TO_DOWNLOAD="checkpoint:http://127.0.0.1:9/..,checkpoint:http://127.0.0.1:9/.hidden,lora:https://127.0.0.1:9/x.safetensors 0000000000000000000000000000000000000000000000000000000000000000" \
       /bin/bash "$dl" 2>&1
   )" || fail "model downloader exited non-zero"
   grep -q "MODELS_DOWNLOAD_DIR must be inside" <<<"$out" || fail "MODELS_DOWNLOAD_DIR outside models was not ignored"
   grep -q "Refusing unsafe file name: \.\." <<<"$out" || fail "'..' download name was not refused"
   grep -q "Refusing unsafe file name: \.hidden" <<<"$out" || fail "dot-file download name was not refused"
-  grep -q "resolves outside" <<<"$out" || fail "symlinked type folder outside models was not refused"
+  grep -q "Target: ${base}/models/loras/x.safetensors" <<<"$out" || fail "symlinked type folder under models was not supported"
   [[ -z "$(ls -A "${base}/outside")" ]] || fail "downloader wrote outside the models directory"
   out="$(
     COMFY_UID=4242 MSS_MODELS_LIST="${base}/none.txt" MODELS_TO_DOWNLOAD="x" run_model_downloads 2>&1
