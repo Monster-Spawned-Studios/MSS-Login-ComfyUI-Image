@@ -34,11 +34,24 @@ fi
 MODELS_DIR="$(realpath -m -- "${MODELS_DIR:-/app/ComfyUI/models}")"
 LIST_FILE="${MSS_MODELS_LIST:-/home/comfy/user-scripts/models-to-download.txt}"
 
-# True when $1 (resolved, may not exist yet) is MODELS_DIR or inside it.
+# True when $1 (may be a symlink or inside a symlinked subfolder) resolves or logically sits inside MODELS_DIR.
 inside_models_dir() {
-    local p
-    p="$(realpath -m -- "$1")" || return 1
-    [[ "$p" == "$MODELS_DIR" || "$p" == "$MODELS_DIR"/* ]]
+    local p="$1"
+    local p_deref p_logical base_deref base_logical
+    base_deref="$(realpath -m -- "$MODELS_DIR")" || return 1
+    base_logical="$(realpath -s -m -- "$MODELS_DIR")" || return 1
+    p_deref="$(realpath -m -- "$p")" || return 1
+    p_logical="$(realpath -s -m -- "$p")" || return 1
+
+    # Allowed if canonical path is within canonical MODELS_DIR
+    if [[ "$p_deref" == "$base_deref" || "$p_deref" == "$base_deref"/* ]]; then
+        return 0
+    fi
+    # Allowed if logical path is within logical MODELS_DIR (e.g. symlinked model subfolders)
+    if [[ "$p_logical" == "$base_logical" || "$p_logical" == "$base_logical"/* ]]; then
+        return 0
+    fi
+    return 1
 }
 
 if [ -n "${MODELS_DOWNLOAD_DIR:-}" ] && ! inside_models_dir "$MODELS_DOWNLOAD_DIR"; then
@@ -735,7 +748,7 @@ while IFS= read -r raw_line || [ -n "$raw_line" ]; do
         continue
     fi
 
-    dest="$(realpath -m -- "$TARGET_DIR/$filename")"
+    dest="$TARGET_DIR/$filename"
     if ! inside_models_dir "$dest"; then
         echo "  ⚠ Refusing destination outside ${MODELS_DIR}: $dest" >&2
         continue
